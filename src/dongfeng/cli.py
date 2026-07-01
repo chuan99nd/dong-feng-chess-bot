@@ -502,6 +502,20 @@ def eval_arena(
     )
 
 
+@app.command()
+def web(
+    engine: str = typer.Option("neural", "--engine", help="random | neural."),
+    ckpt: str | None = typer.Option(None, "--ckpt", help="Neural checkpoint (or $DONGFENG_CKPT)."),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    no_open: bool = typer.Option(False, "--no-open", help="Do not auto-open the browser."),
+) -> None:
+    """Launch the browser UI to play against an engine (open http://host:port)."""
+    from .serve import serve  # noqa: PLC0415
+
+    serve(host=host, port=port, engine=engine, checkpoint=ckpt, open_browser=not no_open)
+
+
 def main() -> None:
     """Console-script entry point (see ``[project.scripts]`` ``dfc``)."""
     app()

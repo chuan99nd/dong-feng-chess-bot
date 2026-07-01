@@ -59,6 +59,11 @@ src = ["src"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# The web UI embeds a self-contained HTML/CSS/JS page as one string literal;
+# its long CSS/JS lines are not Python and should not be reflowed.
+"src/dongfeng/serve/webplay.py" = ["E501"]
+
 [tool.pyright]
 include = ["src"]
 pythonVersion = "3.11"
