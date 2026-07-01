@@ -1,0 +1,60 @@
+[project]
+name = "dongfeng"
+version = "0.0.0"
+description = "Dong Feng — an LLM-style Xiangqi (Chinese chess) AI monorepo."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Dong Feng contributors" }]
+
+# Core runtime dependencies.
+#
+# `cchess` is the confirmed Xiangqi rules library (walker8088, PyPI, LGPL-3.0).
+#   - pip install name: cchess ; import name: `import cchess`
+#   - Provides ChessBoard (FEN/ICCS), pseudo-legal create_moves() + is_checked_move()
+#     for legality filtering, and check/mate detection.
+#   - NOTE / RISK: this import name COLLIDES with the GitHub package
+#     `windshadow233/python-chinese-chess` which is a DIFFERENT library with an
+#     incompatible API. Only the PyPI `cchess` (pinned below) is supported here.
+#   - It is mature and actively maintained, so it is treated as a hard dependency.
+#     Even so, core/board.py degrades gracefully: if the import fails it raises a
+#     clear ImportError with an install hint from inside the Board constructor,
+#     never at module import time.
+dependencies = [
+    "cchess>=1.25,<2",
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "pyright>=1.1.370",
+]
+mcp = [
+    "mcp>=1.0",
+]
+
+[project.scripts]
+dfc = "dongfeng.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dongfeng"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false

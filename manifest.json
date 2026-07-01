@@ -1,0 +1,46 @@
+{
+  "schema": {
+    "version": 1,
+    "note": "Dong Feng artifacts index — the single source of truth for datasets, checkpoints, and runs. Datasets/checkpoints/runs live under data/, checkpoints/, runs/ which are large and git-ignored; agents and the dfc CLI query THIS file (or the MCP server in tools/mcp_server.py) instead of reading those artifacts. Keep entries small: metadata and metrics only, never raw contents.",
+    "entries": {
+      "datasets": {
+        "id": "unique dataset id",
+        "path": "location under data/ (git-ignored)",
+        "source": "e.g. dpxq-xqf, tiantian-pgn, chessdb",
+        "format": "xqf | cbr | cbl | pgn",
+        "num_games": "int",
+        "num_samples": "int (FEN,move pairs)",
+        "tokenizer": "tokenizer id this dataset is tokenized for (or null)",
+        "created": "ISO 8601 timestamp",
+        "notes": "free text"
+      },
+      "checkpoints": {
+        "id": "unique checkpoint id",
+        "path": "location under checkpoints/ (git-ignored)",
+        "arch": "model architecture tag",
+        "params": "int parameter count",
+        "step": "int training step",
+        "dataset": "dataset id it trained on",
+        "run": "run id that produced it",
+        "tokenizer": "tokenizer id",
+        "metrics": "object, e.g. {\"elo\": int, \"top1_acc\": float}",
+        "created": "ISO 8601 timestamp"
+      },
+      "runs": {
+        "id": "unique run id",
+        "kind": "bc | distill | dpo | selfplay | eval",
+        "status": "running | done | failed",
+        "config": "path or inline summary of the run config",
+        "checkpoint": "checkpoint id produced (or null)",
+        "metrics": "object of headline metrics",
+        "started": "ISO 8601 timestamp",
+        "finished": "ISO 8601 timestamp (or null)"
+      }
+    },
+    "tokenizer_info_note": "Tokenizer vocabularies are described inline under the top-level `tokenizers` array once M1 lands; the MCP tokenizer_info tool reads that array."
+  },
+  "tokenizers": [],
+  "datasets": [],
+  "checkpoints": [],
+  "runs": []
+}

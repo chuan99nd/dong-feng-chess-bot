@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v ruff >/dev/null 2>&1 && ruff format \"$CLAUDE_PROJECT_DIR\" >/dev/null 2>&1; command -v ruff >/dev/null 2>&1 && ruff check --fix \"$CLAUDE_PROJECT_DIR\" >/dev/null 2>&1; exit 0"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/run_protocol_tests.py\""
+          }
+        ]
+      }
+    ]
+  }
+}
