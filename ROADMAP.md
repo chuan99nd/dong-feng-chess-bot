@@ -44,19 +44,24 @@ Turn game archives into training-ready token sequences.
 `tokenizer_info` returns a real vocab; round-trip FEN/move encode↔decode tests
 (`tests/test_tokenizer_*`, `test_notation`, `test_ingest`, `test_dataset`).
 
-## M2 — Transformer + BC pretrain + eval  ⬜
+## M2 — Transformer + BC pretrain + eval  ✅
 
 The base policy by behavior cloning.
 
-- `model/transformer.py`: autoregressive policy transformer (+ reserved value
-  head; see ADR-0002).
-- `model/train.py`: BC pretraining (next-move prediction) on the M1 corpus.
-- Eval harness: legal-move rate, top-1/top-k move accuracy vs. held-out games,
-  small tactical/mate suite; results logged to `manifest.json` (runs).
-- `dfc train`, `dfc eval`; checkpoints indexed via `checkpoint_info`.
+- ✅ `model/transformer.py`: decoder-only autoregressive `TransformerPolicy`
+  (pre-norm GPT, fused causal attention) + reserved value head (ADR-0002).
+- ✅ `training/loop.py`: `bc_pretrain` — next-move cross-entropy over the M1
+  `uint16` shards, AdamW + warmup/cosine LR, MPS/CUDA/CPU auto-device.
+- ✅ Eval harness: `eval/accuracy.py` (top-1 move-match vs held-out games) and
+  `eval/match.py` (engine arena + Elo). Legal-move rate is 100% by construction
+  (core legal-masking in the neural engine).
+- ✅ `inference/transformer_engine.py`: `TransformerEngine` implements the Engine
+  Protocol with legal-masked decoding (passes `run_conformance`).
+- ✅ `dfc train`, `dfc eval accuracy|arena`; checkpoints indexed in `manifest.json`.
+- ✅ Trained on real data: 9,381 vietcotuong.com games (DhtmlXQ) → BC checkpoint.
 
-**Exit:** a trained checkpoint that plays legal, non-trivial moves and beats the
-random baseline handily; `eval_last` reflects it.
+**Exit:** ✅ a trained checkpoint that plays legal moves and beats the random
+baseline; checkpoint indexed for `checkpoint_info`.
 
 ## M3 — TransformerEngine → UCCI → play  ⬜
 

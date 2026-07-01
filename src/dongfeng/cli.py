@@ -45,16 +45,24 @@ _console = Console()
 
 # -- engine factory ---------------------------------------------------------
 
-_ENGINE_CHOICES = ("random", "pikafish")
+_ENGINE_CHOICES = ("random", "pikafish", "neural")
 
 
 def _make_engine(name: str, seed: int | None = None) -> Engine:
-    """Build an :class:`Engine` by short name (``random`` / ``pikafish``)."""
+    """Build an :class:`Engine` by short name (``random`` / ``pikafish`` / ``neural``).
+
+    ``neural`` loads a trained checkpoint from ``$DONGFENG_CKPT`` (or a random-init
+    model if unset); it needs the optional ``model`` extra (torch).
+    """
     key = name.lower()
     if key == "random":
         return RandomEngine(seed=seed)
     if key == "pikafish":
         return PikafishEngine()
+    if key == "neural":
+        from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
+
+        return TransformerEngine(os.environ.get("DONGFENG_CKPT") or None)
     raise typer.BadParameter(f"unknown engine {name!r}; choose one of {', '.join(_ENGINE_CHOICES)}")
 
 
@@ -371,6 +379,127 @@ def data_tokenize(
         _console.print(f"[bold]{tok.id}[/bold] vocab={tok.vocab_size} tokens={len(ids)}")
         _console.print(f"ids: {ids}")
         _console.print(f"decode: {tok.decode(ids)}")
+
+
+# -- training + eval (M2) ---------------------------------------------------
+
+
+@app.command()
+def train(
+    data_dir: str = typer.Option(..., "--data", help="Dir of tokenized shards (dfc data ingest)."),
+    out: str = typer.Option(..., "--out", help="Output dir for the checkpoint."),
+    checkpoint_id: str = typer.Option(..., "--id", help="Checkpoint id for the manifest."),
+    n_layer: int = typer.Option(4, "--layers"),
+    n_embd: int = typer.Option(256, "--width"),
+    n_head: int = typer.Option(4, "--heads"),
+    block_size: int = typer.Option(256, "--block"),
+    batch_size: int = typer.Option(64, "--batch"),
+    lr: float = typer.Option(3e-4, "--lr"),
+    max_steps: int = typer.Option(2000, "--steps"),
+    warmup: int = typer.Option(100, "--warmup"),
+    device: str = typer.Option("auto", "--device", help="auto | cpu | mps | cuda"),
+    seed: int = typer.Option(0, "--seed"),
+) -> None:
+    """Behavior-cloning pretrain of the decoder-only transformer on move shards (M2)."""
+    from .model import TransformerConfig, TransformerPolicy  # noqa: PLC0415
+    from .training.base import TrainConfig  # noqa: PLC0415
+    from .training.loop import bc_pretrain, resolve_device  # noqa: PLC0415
+
+    tok = MoveTokenizer()
+    model = TransformerPolicy(
+        TransformerConfig(
+            vocab_size=tok.vocab_size,
+            block_size=block_size,
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+        )
+    )
+    resolved = resolve_device(device)
+    _console.print(
+        f"Training [bold]{checkpoint_id}[/bold]: {model.num_params():,} params on "
+        f"[bold]{resolved}[/bold] for {max_steps} steps (vocab {tok.vocab_size})"
+    )
+    tcfg = TrainConfig(
+        data_dir=Path(data_dir),
+        out_dir=Path(out),
+        batch_size=batch_size,
+        lr=lr,
+        warmup_steps=warmup,
+        max_steps=max_steps,
+        device=device,
+        seed=seed,
+        checkpoint_every=max(max_steps // 10, 1),
+    )
+    ckpt = bc_pretrain(model, tcfg)
+
+    created = datetime.now(UTC).isoformat(timespec="seconds")
+    m = _load_manifest()
+    checkpoints = m.setdefault("checkpoints", [])
+    entry = {
+        "id": checkpoint_id,
+        "path": str(ckpt),
+        "arch": f"transformer-{n_layer}L-{n_embd}d",
+        "params": model.num_params(),
+        "step": max_steps,
+        "tokenizer": tok.id,
+        "metrics": {},
+        "created": created,
+    }
+    for i, c in enumerate(checkpoints):
+        if c.get("id") == checkpoint_id:
+            checkpoints[i] = entry
+            break
+    else:
+        checkpoints.append(entry)
+    _save_manifest(m)
+    _console.print(f"[bold green]Saved[/bold green] checkpoint to {ckpt}")
+
+
+eval_app = typer.Typer(
+    name="eval", help="Strength & accuracy evaluation (M2+).", no_args_is_help=True
+)
+app.add_typer(eval_app)
+
+
+@eval_app.command("accuracy")
+def eval_accuracy(
+    ckpt: str = typer.Option(..., "--ckpt", help="Checkpoint path."),
+    data: str = typer.Option(..., "--data", help="Held-out games file/dir."),
+    max_positions: int = typer.Option(1000, "--positions"),
+    device: str = typer.Option("cpu", "--device"),
+) -> None:
+    """Top-1 move-match accuracy of a checkpoint against held-out games."""
+    from .eval import move_accuracy  # noqa: PLC0415
+    from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
+
+    engine = TransformerEngine(ckpt, device=device)
+    res = move_accuracy(engine, iter_games_in(data), max_positions=max_positions)
+    _console.print(
+        f"top-1 accuracy: [bold]{res.top1_acc:.1%}[/bold] "
+        f"({res.top1}/{res.positions} positions)"
+    )
+
+
+@eval_app.command("arena")
+def eval_arena(
+    ckpt: str = typer.Option(..., "--ckpt", help="Checkpoint path for the neural engine."),
+    games: int = typer.Option(20, "--games"),
+    opponent: str = typer.Option("random", "--opponent"),
+    device: str = typer.Option("cpu", "--device"),
+    seed: int = typer.Option(0, "--seed"),
+) -> None:
+    """Play the neural engine vs a baseline and report W/D/L + estimated Elo."""
+    from .eval import play_match  # noqa: PLC0415
+    from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
+
+    neural = TransformerEngine(ckpt, device=device)
+    baseline = _make_engine(opponent, seed=seed)
+    res = play_match(neural, baseline, games=games, limits=SearchLimits(movetime_ms=10))
+    _console.print(
+        f"neural vs {opponent}: [bold]{res.wins}W-{res.draws}D-{res.losses}L[/bold] "
+        f"(score {res.score:.1%}, Elo diff {res.elo_diff:+.0f})"
+    )
 
 
 def main() -> None:

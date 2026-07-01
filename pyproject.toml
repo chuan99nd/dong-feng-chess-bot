@@ -34,6 +34,12 @@ dev = [
 mcp = [
     "mcp>=1.0",
 ]
+# The neural stack (model + training + neural inference). Kept optional so the
+# core engine/protocol/data layers install without a heavy tensor dependency.
+model = [
+    "torch>=2.2",
+    "numpy>=1.26",
+]
 
 [project.scripts]
 dfc = "dongfeng.cli:app"

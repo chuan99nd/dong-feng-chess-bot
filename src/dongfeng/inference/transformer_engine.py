@@ -1,116 +1,146 @@
-"""Neural engine: a :class:`~dongfeng.protocol.engine.Engine` backed by a transformer (stub).
+"""Neural engine: a :class:`~dongfeng.protocol.engine.Engine` backed by a transformer (M3).
 
-Roadmap milestone: **M3**.
+:class:`TransformerEngine` is where the neural model plugs into the SAME universal
+:class:`~dongfeng.protocol.engine.Engine` contract every other bot implements, so
+it is a drop-in for the arena, CLI, UCCI adapter, and conformance harness.
 
-:class:`TransformerEngine` is the point where the neural model plugs into the SAME
-universal :class:`~dongfeng.protocol.engine.Engine` contract that every other bot
-(Pikafish wrapper, random baseline, third-party engines) implements. Because it
-conforms to that Protocol, it is a drop-in for any match runner, arena, CLI, or MCP
-server, and it can be validated with
-:func:`dongfeng.protocol.conformance.run_conformance`.
+Decoding pipeline:
 
-Planned behavior (pinned in M3):
+1. **Load a checkpoint** — a trained :class:`~dongfeng.model.transformer.TransformerPolicy`
+   (or a fresh random-init model if no checkpoint is given).
+2. **Tokenize the history** — the moves played so far are encoded as
+   ``[BOS] m1 m2 ...`` with the :class:`~dongfeng.tokenizer.move_tokenizer.MoveTokenizer`.
+3. **Legal-move masking from core** — the policy logits are restricted to the legal
+   moves reported by :func:`dongfeng.core.new_board`, so the engine can NEVER emit
+   an illegal move even if the raw policy puts mass on one.
+4. **Sample / argmax** — a move is chosen from the masked distribution
+   (``Temperature`` / ``TopK`` via :meth:`set_option`; temperature ``0`` = argmax).
 
-1. **Load a checkpoint** — a trained :class:`~dongfeng.model.base.PolicyModel`
-   (see :mod:`dongfeng.training`) is loaded once at construction.
-2. **Tokenize the position** — the current FEN (+ move history) is encoded via the
-   board / move tokenizers (:mod:`dongfeng.tokenizer`).
-3. **Apply legal-move masking from core** — the model's policy logits are masked to
-   the legal moves reported by :func:`dongfeng.core.new_board` (a Board's
-   ``legal_moves()``), so the engine can never emit an illegal move even if the raw
-   policy assigns mass to one.
-4. **Sample / argmax** — a move is chosen from the masked distribution (temperature
-   / top-k configurable via :meth:`set_option`); :meth:`analyze` additionally
-   surfaces per-move policy priors and (if the model has a value head) win
-   probabilities as :class:`~dongfeng.protocol.engine.ScoredMove` entries.
-
-Until M3, every method raises ``NotImplementedError("planned: M3")``.
+The ``torch`` import is deferred to construction so importing this module never
+requires the optional ``model`` extra.
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+from ..core import STARTING_FEN, new_board
 from ..core.types import Move
-from ..protocol.engine import Analysis, Engine, EngineInfo, SearchLimits
+from ..protocol.engine import Analysis, Engine, EngineInfo, ScoredMove, SearchLimits
+from ..tokenizer.move_tokenizer import MoveTokenizer
+
+_INSTALL_HINT = "The neural engine needs the 'model' extra: uv sync --extra model"
 
 
 class TransformerEngine(Engine):
-    """Transformer-backed :class:`Engine` (M3 stub).
+    """Transformer-backed :class:`Engine` with legal-masked policy decoding."""
 
-    Implements the universal engine contract so the neural model is interchangeable
-    with any other bot. All methods raise ``NotImplementedError`` until milestone
-    M3; the signatures match :class:`dongfeng.protocol.engine.Engine` exactly.
-    """
+    def __init__(self, checkpoint: str | None = None, *, device: str = "cpu") -> None:
+        try:
+            import torch  # noqa: PLC0415
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise ImportError(_INSTALL_HINT) from exc
+        self._torch = torch
+        self._device = device
+        self._tok = MoveTokenizer()
+        self._temperature = 0.0  # 0 = argmax
+        self._top_k = 0  # 0 = no top-k restriction
+        self._rng = torch.Generator().manual_seed(0)
 
-    def __init__(self, checkpoint: str | None = None) -> None:
-        """Create the engine, planning to load ``checkpoint`` (a trained policy model).
+        from ..model.transformer import TransformerConfig, TransformerPolicy  # noqa: PLC0415
 
-        Args:
-            checkpoint: Path to a trained model checkpoint to load at construction.
+        if checkpoint is not None:
+            self._model, self._extra = TransformerPolicy.load(checkpoint, map_location=device)
+        else:
+            # Random-init fallback (still emits legal moves) — useful for conformance.
+            cfg = TransformerConfig(vocab_size=self._tok.vocab_size, n_layer=2, n_embd=64, n_head=2)
+            self._model, self._extra = TransformerPolicy(cfg), {}
+        self._model.to(device).eval()
 
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+        self._board = new_board(STARTING_FEN)
+        self._history: list[Move] = []
+
+    # -- Engine protocol ----------------------------------------------------
 
     def id(self) -> EngineInfo:
-        """Return static engine identification.
-
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+        step = self._extra.get("step")
+        name = "Dong Feng Neural" + (f" (step {step})" if step is not None else "")
+        return EngineInfo(
+            name=name,
+            author="Dong Feng contributors",
+            options={"Temperature": "0.0", "TopK": "0", "Seed": "0"},
+        )
 
     def new_game(self) -> None:
-        """Reset per-game state.
-
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+        self._board = new_board(STARTING_FEN)
+        self._history = []
 
     def set_position(self, fen: str, moves: list[Move]) -> None:
-        """Set the root position to ``fen`` then apply ``moves`` in order.
+        self._board = new_board(fen)
+        for m in moves:
+            self._board.push(m)
+        self._history = list(moves)
 
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+    def _policy_logits(self) -> Any:
+        torch = self._torch
+        ids = [self._tok.BOS_ID, *(self._tok.encode_move(m) for m in self._history)]
+        ids = ids[-self._model.config.block_size :]
+        x = torch.tensor([ids], dtype=torch.long, device=self._device)
+        with torch.no_grad():
+            logits = self._model(x)[0, -1]  # [vocab]
+        return logits
 
-    def analyze(self, limits: SearchLimits) -> Analysis:
-        """Evaluate the current position and return scored candidate moves.
-
-        The M3 implementation tokenizes the position, runs the model, masks to legal
-        moves from core, and returns policy priors (and win probabilities if a value
-        head is present).
-
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+    def _masked_scores(self) -> tuple[list[Move], Any]:
+        """Return ``(legal_moves, probabilities)`` over the legal moves (or ``[], None``)."""
+        torch = self._torch
+        legal = self._board.legal_moves()
+        if not legal:
+            return [], None
+        logits = self._policy_logits()
+        legal_ids = torch.tensor([self._tok.encode_move(m) for m in legal], device=self._device)
+        legal_logits = logits[legal_ids]
+        temp = self._temperature if self._temperature > 0 else 1.0
+        probs = torch.softmax(legal_logits / temp, dim=-1)
+        return legal, probs
 
     def bestmove(self, limits: SearchLimits) -> Move:
-        """Return the chosen move for the current position.
+        legal, probs = self._masked_scores()
+        if not legal:
+            raise ValueError("no legal moves in the current position")
+        torch = self._torch
+        if self._temperature <= 0:
+            idx = int(torch.argmax(probs).item())
+        else:
+            p = probs
+            if 0 < self._top_k < len(legal):
+                top = torch.topk(p, self._top_k)
+                filtered = torch.zeros_like(p)
+                filtered[top.indices] = top.values
+                p = filtered / filtered.sum()
+            idx = int(torch.multinomial(p, 1, generator=self._rng).item())
+        return legal[idx]
 
-        The M3 implementation samples (or takes the argmax of) the legal-masked
-        policy.
-
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+    def analyze(self, limits: SearchLimits) -> Analysis:
+        legal, probs = self._masked_scores()
+        if not legal:
+            return Analysis(moves=[])
+        order = sorted(range(len(legal)), key=lambda i: float(probs[i]), reverse=True)
+        scored = [ScoredMove(move=legal[i], policy_prob=float(probs[i])) for i in order]
+        return Analysis(moves=scored)
 
     def set_option(self, name: str, value: str) -> None:
-        """Set an engine option (e.g. sampling temperature, top-k) by name.
+        key = name.lower()
+        if key == "temperature":
+            self._temperature = float(value)
+        elif key == "topk":
+            self._top_k = int(value)
+        elif key == "seed":
+            self._rng = self._torch.Generator().manual_seed(int(value))
+        elif key == "checkpoint":
+            from ..model.transformer import TransformerPolicy  # noqa: PLC0415
 
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+            self._model, self._extra = TransformerPolicy.load(value, map_location=self._device)
+            self._model.to(self._device).eval()
 
     def stop(self) -> None:
-        """Request that any in-progress evaluation stop.
-
-        Raises:
-            NotImplementedError: always — planned for milestone M3.
-        """
-        raise NotImplementedError("planned: M3")
+        """No-op: single-forward-pass inference has nothing to interrupt."""

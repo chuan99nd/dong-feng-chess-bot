@@ -26,8 +26,8 @@ jobs:
       - name: Set up Python 3.11
         run: uv python install 3.11
 
-      - name: Sync dependencies (with dev extras)
-        run: uv sync --extra dev
+      - name: Sync dependencies (dev + model extras)
+        run: uv sync --extra dev --extra model
 
       - name: Ruff format check
         run: uv run ruff format --check .
