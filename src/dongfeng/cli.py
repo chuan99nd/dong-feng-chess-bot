@@ -15,7 +15,12 @@ Run as ``dfc <command>`` (see ``[project.scripts]``) or ``python -m dongfeng.cli
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -23,9 +28,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .core import STARTING_FEN, Board, GameResult, Move, new_board
+from .data import build_shards, iter_games_in
 from .engines import PikafishEngine, RandomEngine
 from .protocol.engine import Engine, SearchLimits
 from .protocol.ucci import ProtocolAdapter
+from .tokenizer import BoardTokenizer, MoveTokenizer
 
 app = typer.Typer(
     name="dfc",
@@ -204,6 +211,166 @@ def ucci(
     """
     adapter = ProtocolAdapter(_make_engine(engine))
     adapter.run(sys.stdin, sys.stdout)
+
+
+# -- data pipeline (M1) -----------------------------------------------------
+
+data_app = typer.Typer(
+    name="data",
+    help="Corpus ingestion + tokenization (M1).",
+    no_args_is_help=True,
+)
+app.add_typer(data_app)
+
+
+def _manifest_path() -> Path:
+    """Resolve the artifacts manifest (env override, else ./manifest.json)."""
+    return Path(os.environ.get("DONGFENG_MANIFEST", "manifest.json"))
+
+
+def _load_manifest() -> dict[str, Any]:
+    path = _manifest_path()
+    if path.exists():
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {"tokenizers": [], "datasets": [], "checkpoints": [], "runs": []}
+
+
+def _save_manifest(m: dict[str, Any]) -> None:
+    with open(_manifest_path(), "w", encoding="utf-8") as fh:
+        json.dump(m, fh, indent=2)
+        fh.write("\n")
+
+
+def _register_tokenizers(m: dict[str, Any]) -> None:
+    """Ensure the manifest lists the built-in tokenizers (id + vocab_size)."""
+    known = {t.get("id") for t in m.get("tokenizers", [])}
+    for tok, kind in ((MoveTokenizer(), "move"), (BoardTokenizer(), "board")):
+        if tok.id not in known:
+            m.setdefault("tokenizers", []).append(
+                {"id": tok.id, "kind": kind, "vocab_size": tok.vocab_size}
+            )
+
+
+def _upsert_dataset(m: dict[str, Any], entry: dict[str, Any]) -> None:
+    """Insert or replace a dataset entry (matched by id) in the manifest."""
+    datasets = m.setdefault("datasets", [])
+    for i, d in enumerate(datasets):
+        if d.get("id") == entry["id"]:
+            datasets[i] = entry
+            return
+    datasets.append(entry)
+
+
+@data_app.command("ingest")
+def data_ingest(
+    path: str = typer.Argument(..., help="Game file or directory (.pgn/.xqf/.cbf/.cbl/.cbr/.txt)."),
+    out: str = typer.Option(..., "--out", help="Output dir for shards (under data/)."),
+    dataset_id: str = typer.Option(..., "--id", help="Unique dataset id for the manifest."),
+    shard_size: int = typer.Option(1_048_576, "--shard-size", help="Target token ids per shard."),
+) -> None:
+    """Parse games, tokenize to autoregressive shards, and index in the manifest."""
+    created = datetime.now(UTC).isoformat(timespec="seconds")
+    stats = build_shards(
+        iter_games_in(path), out, tokenizer=MoveTokenizer(), shard_size=shard_size, created=created
+    )
+    m = _load_manifest()
+    _register_tokenizers(m)
+    _upsert_dataset(
+        m,
+        {
+            "id": dataset_id,
+            "path": out,
+            "source": Path(path).name,
+            "format": "mixed",
+            "num_games": stats.num_games,
+            "num_samples": stats.num_samples,
+            "tokenizer": stats.tokenizer,
+            "created": created,
+            "notes": f"{stats.num_tokens} tokens across {stats.num_shards} shard(s); "
+            f"{stats.skipped_games} game(s) skipped",
+        },
+    )
+    _save_manifest(m)
+
+    table = Table(title=f"Ingested dataset {dataset_id!r}")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for label, value in (
+        ("Games", stats.num_games),
+        ("Plies (samples)", stats.num_samples),
+        ("Tokens", stats.num_tokens),
+        ("Shards", stats.num_shards),
+        ("Skipped games", stats.skipped_games),
+        ("Tokenizer", f"{stats.tokenizer} (vocab {stats.vocab_size})"),
+    ):
+        table.add_row(label, str(value))
+    _console.print(table)
+    _console.print(f"Shards + dataset_meta.json written to [bold]{out}[/bold]")
+
+
+@data_app.command("stats")
+def data_stats(
+    dataset_id: str | None = typer.Option(None, "--id", help="Show only this dataset."),
+) -> None:
+    """Show indexed datasets and tokenizers from the manifest."""
+    m = _load_manifest()
+    datasets = m.get("datasets", [])
+    if dataset_id is not None:
+        datasets = [d for d in datasets if d.get("id") == dataset_id]
+        if not datasets:
+            _console.print(f"[red]No dataset with id {dataset_id!r}.[/red]")
+            raise typer.Exit(1)
+
+    if not datasets:
+        _console.print("No datasets indexed yet. Run [bold]dfc data ingest[/bold].")
+    else:
+        table = Table(title="Datasets")
+        for col in ("id", "source", "games", "samples", "tokenizer", "created"):
+            table.add_column(col)
+        for d in datasets:
+            table.add_row(
+                str(d.get("id")),
+                str(d.get("source")),
+                str(d.get("num_games")),
+                str(d.get("num_samples")),
+                str(d.get("tokenizer")),
+                str(d.get("created")),
+            )
+        _console.print(table)
+
+    tokenizers = m.get("tokenizers", [])
+    if tokenizers:
+        ttable = Table(title="Tokenizers")
+        for col in ("id", "kind", "vocab_size"):
+            ttable.add_column(col)
+        for t in tokenizers:
+            ttable.add_row(str(t.get("id")), str(t.get("kind")), str(t.get("vocab_size")))
+        _console.print(ttable)
+
+
+@data_app.command("tokenize")
+def data_tokenize(
+    text: str = typer.Argument(
+        ..., help="ICCS move(s) like 'h2e2 h9g7', or a FEN with --board."
+    ),
+    board_mode: bool = typer.Option(
+        False, "--board", help="Treat input as a FEN (BoardTokenizer)."
+    ),
+) -> None:
+    """Demo encode/decode round-trip for the move or board tokenizer."""
+    if board_mode:
+        tok: Any = BoardTokenizer()
+        ids = tok.encode(text)
+        _console.print(f"[bold]{tok.id}[/bold] vocab={tok.vocab_size} tokens={len(ids)}")
+        _console.print(f"ids: {ids}")
+        _console.print(f"decode: {tok.decode(ids)}")
+    else:
+        tok = MoveTokenizer()
+        ids = tok.encode(text)
+        _console.print(f"[bold]{tok.id}[/bold] vocab={tok.vocab_size} tokens={len(ids)}")
+        _console.print(f"ids: {ids}")
+        _console.print(f"decode: {tok.decode(ids)}")
 
 
 def main() -> None:

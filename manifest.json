@@ -1,7 +1,7 @@
 {
   "schema": {
     "version": 1,
-    "note": "Dong Feng artifacts index — the single source of truth for datasets, checkpoints, and runs. Datasets/checkpoints/runs live under data/, checkpoints/, runs/ which are large and git-ignored; agents and the dfc CLI query THIS file (or the MCP server in tools/mcp_server.py) instead of reading those artifacts. Keep entries small: metadata and metrics only, never raw contents.",
+    "note": "Dong Feng artifacts index \u2014 the single source of truth for datasets, checkpoints, and runs. Datasets/checkpoints/runs live under data/, checkpoints/, runs/ which are large and git-ignored; agents and the dfc CLI query THIS file (or the MCP server in tools/mcp_server.py) instead of reading those artifacts. Keep entries small: metadata and metrics only, never raw contents.",
     "entries": {
       "datasets": {
         "id": "unique dataset id",
@@ -37,9 +37,20 @@
         "finished": "ISO 8601 timestamp (or null)"
       }
     },
-    "tokenizer_info_note": "Tokenizer vocabularies are described inline under the top-level `tokenizers` array once M1 lands; the MCP tokenizer_info tool reads that array."
+    "tokenizer_info_note": "Built-in tokenizers are listed under the top-level `tokenizers` array; the MCP tokenizer_info tool reads it. `dfc data ingest` (re)registers them automatically."
   },
-  "tokenizers": [],
+  "tokenizers": [
+    {
+      "id": "move-v1",
+      "kind": "move",
+      "vocab_size": 2554
+    },
+    {
+      "id": "board-v1",
+      "kind": "board",
+      "vocab_size": 21
+    }
+  ],
   "datasets": [],
   "checkpoints": [],
   "runs": []

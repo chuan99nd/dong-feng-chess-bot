@@ -71,7 +71,6 @@ def dataset_stats() -> dict[str, Any]:
             }
             for d in datasets
         ],
-        "note": "empty until M1 (data + tokenizer) lands",
     }
 
 
@@ -161,7 +160,6 @@ def tokenizer_info(tokenizer_id: str | None = None) -> dict[str, Any]:
     return {
         "count": len(tokenizers),
         "tokenizers": [{"id": t.get("id"), "vocab_size": t.get("vocab_size")} for t in tokenizers],
-        "note": "empty until M1 (tokenizer) lands",
     }
 
 

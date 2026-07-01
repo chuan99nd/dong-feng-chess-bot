@@ -23,10 +23,10 @@ env/
 .coverage
 htmlcov/
 
-# Project artifacts
-data/
-checkpoints/
-runs/
+# Project artifacts (root-anchored so they don't match the src/dongfeng/data package)
+/data/
+/checkpoints/
+/runs/
 
 # Engines / nets (large binaries)
 *.nnue

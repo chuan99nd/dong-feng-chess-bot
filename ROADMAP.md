@@ -25,20 +25,24 @@ The foundation everything else plugs into.
 **Exit:** `uv sync`, `uv run pytest`, `uv run dfc selfplay`, `uv run dfc ucci`
 all work; `run_conformance` passes for the baseline engine; CI is green.
 
-## M1 — Data + tokenizer  ⬜
+## M1 — Data + tokenizer  ✅
 
 Turn game archives into training-ready token sequences.
 
-- Ingest XQF/CBR/CBL/PGN via `cchess` → `(FEN, next_move)` pairs (`data/ingest.py`).
+- ✅ Ingest XQF/CBF/CBL/CBR/PGN/TXT via `cchess` → `Game` / `(FEN, move)` pairs
+  (`data/ingest.py`: per-format parsers + `parse_file`/`iter_games_in` dispatch).
 - Corpus sources: DPXQ (XQF), optional TianTian/QQ scrapes, ChessDB position evals.
-- Filtering: keep winning-side moves in decisive games (both sides in draws);
-  drop very short / disconnect-terminated games.
-- Tokenizer: FEN ↔ token ids, ICCS move vocabulary (`data/tokenizer.py`).
-- `dataset.py`: shard + stream samples; record stats in `manifest.json`.
-- `dfc data ingest|tokenize|stats`; WXF↔ICCS converter (`core.notation`).
+- ✅ Filtering: `iter_samples(winning_side_only=…)` keeps the winning side's moves
+  in decisive games (both sides in draws); illegal/corrupt tails are dropped.
+- ✅ Tokenizers: `MoveTokenizer` (flat ICCS move index, 2554 vocab) and
+  `BoardTokenizer` (per-point FEN grid, length-91) — both round-trip.
+- ✅ `dataset.py`: `build_shards` writes `uint16` autoregressive shards +
+  `dataset_meta.json`; stats recorded in `manifest.json`.
+- ✅ `dfc data ingest|tokenize|stats`; WXF↔ICCS converter (`core.notation`).
 
-**Exit:** a reproducible corpus with `dataset_stats` populated in the manifest;
-`tokenizer_info` returns a real vocab; round-trip FEN/move encode↔decode tests.
+**Exit:** ✅ a reproducible corpus with `dataset_stats` populated in the manifest;
+`tokenizer_info` returns a real vocab; round-trip FEN/move encode↔decode tests
+(`tests/test_tokenizer_*`, `test_notation`, `test_ingest`, `test_dataset`).
 
 ## M2 — Transformer + BC pretrain + eval  ⬜
 
