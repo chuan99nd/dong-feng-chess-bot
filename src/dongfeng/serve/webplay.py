@@ -92,6 +92,23 @@ class GameSession:
             engine_move = self._engine_reply()
             return {"error": None, "engine_move": engine_move, "state": self._state()}
 
+    def undo(self) -> dict[str, Any]:
+        """Take back the human's last move (and the engine's reply); back to human's turn."""
+        with self._lock:
+            # A human move exists only once history is long enough for the human's side.
+            min_len = 1 if self.human is Color.RED else 2
+            if len(self.history) < min_len:
+                return self._state()  # nothing of the human's to take back
+            self.board.pop()
+            self.history.pop()
+            # Keep popping engine plies until it is the human's turn again.
+            while self.history and self.board.turn is not self.human:
+                self.board.pop()
+                self.history.pop()
+            last = self.history[-1] if self.history else None
+            self.last_move = [last.from_sq, last.to_sq] if last else None
+            return self._state()
+
     def _state(self) -> dict[str, Any]:
         return {
             "fen": self.board.fen(),
@@ -158,6 +175,8 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 )
             elif self.path == "/api/move":
                 self._send_json(session.human_move(str(data.get("from")), str(data.get("to"))))
+            elif self.path == "/api/undo":
+                self._send_json(session.undo())
             else:
                 self.send_error(404)
 
@@ -246,7 +265,7 @@ _HTML = r"""<!doctype html>
       <input type="range" id="temp" min="0" max="1.5" step="0.1" value="0"/>
       <div class="row" style="margin-top:10px;">
         <button id="new">Ván mới</button>
-        <button id="undo" class="secondary" title="chưa hỗ trợ" disabled>Đi lại</button>
+        <button id="undo" class="secondary">Đi lại</button>
       </div>
     </div>
     <div class="card">
@@ -363,7 +382,11 @@ function update(){
   let out=""; state.history.forEach((m,i)=>{ if(i%2===0) out+=(i/2+1)+". "; out+=m+(i%2===0?"  ":"\n"); });
   document.getElementById("moves").textContent=out;
 }
+async function undo(){ if(busy||!state) return; busy=true; sel=null; setStatus("Đang đi lại…");
+  state=await(await fetch("/api/undo",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
+  busy=false; render(); update(); }
 document.getElementById("new").addEventListener("click",newGame);
+document.getElementById("undo").addEventListener("click",undo);
 document.getElementById("temp").addEventListener("input",e=>document.getElementById("tval").textContent=e.target.value);
 refresh();
 </script>
