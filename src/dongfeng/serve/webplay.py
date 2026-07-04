@@ -3,10 +3,12 @@
 A single :class:`GameSession` holds the board, move history, and the chosen engine.
 The browser renders the board (SVG) and posts moves to a tiny JSON API:
 
-* ``GET  /``            -> the board page (HTML/CSS/JS, embedded below)
-* ``GET  /api/state``   -> current game state (fen, legal moves, turn, result)
-* ``POST /api/new``     -> reset the game (engine, human color, temperature)
-* ``POST /api/move``    -> apply a human move, then the engine's reply
+* ``GET  /``                    -> the board page (HTML/CSS/JS, embedded below)
+* ``GET  /api/state``           -> current game state (fen, legal moves, turn, result)
+* ``POST /api/new``             -> reset the game (engine, human color, temperature)
+* ``POST /api/move``            -> apply a human move, then the engine's reply
+* ``GET  /api/training``        -> list all training runs (newest first)
+* ``GET  /api/training?id=X``   -> detail for run X with downsampled metrics
 
 The engine runs server-side, so the neural :class:`~dongfeng.inference.transformer_engine.TransformerEngine`
 (PyTorch) works exactly like the random baseline behind the same
@@ -18,8 +20,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from ..core import STARTING_FEN, new_board
@@ -28,11 +32,18 @@ from ..protocol.engine import Engine, SearchLimits
 
 
 def _make_engine(name: str, checkpoint: str | None) -> Engine:
-    """Build an engine by name (``random`` / ``neural``) for the session."""
+    """Build an engine by name (``random`` / ``neural`` / ``board``) for the session."""
     if name == "neural":
         from ..inference.transformer_engine import TransformerEngine  # noqa: PLC0415
 
         return TransformerEngine(checkpoint or os.environ.get("DONGFENG_CKPT") or None)
+    if name == "board":
+        from ..inference.board_engine import BoardTransformerEngine  # noqa: PLC0415
+
+        return BoardTransformerEngine(
+            checkpoint=os.environ.get("DONGFENG_BOARD_CKPT") or None,
+            device="auto",
+        )
     from ..engines import RandomEngine  # noqa: PLC0415
 
     return RandomEngine()
@@ -50,7 +61,9 @@ class GameSession:
         with self._lock:
             self.board = new_board(STARTING_FEN)
             self.history: list[Move] = []
-            self.engine_name = engine_name if engine_name in ("random", "neural") else "random"
+            self.engine_name = (
+                engine_name if engine_name in ("random", "neural", "board") else "random"
+            )
             self.human = Color.RED if human == "red" else Color.BLACK
             self.temperature = temperature
             self.engine = _make_engine(self.engine_name, self._checkpoint)
@@ -63,7 +76,7 @@ class GameSession:
             return self._state()
 
     def _configure_engine(self) -> None:
-        if self.engine_name == "neural":
+        if self.engine_name in ("neural", "board"):
             self.engine.set_option("Temperature", str(self.temperature))
 
     def _engine_reply(self) -> str | None:
@@ -128,6 +141,119 @@ class GameSession:
             return self._state()
 
 
+def _runs_root() -> Path:
+    """Return the runs root directory, overridable via DONGFENG_RUNS_DIR."""
+    return Path(os.environ.get("DONGFENG_RUNS_DIR", "runs"))
+
+
+def _read_run_json(run_dir: Path) -> dict[str, Any] | None:
+    """Read and parse runs/<id>/run.json; return None on any error."""
+    try:
+        with open(run_dir / "run.json") as f:
+            return json.load(f)  # type: ignore[no-any-return]
+    except Exception:
+        return None
+
+
+def _read_last_metrics(metrics_path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Read metrics.jsonl and return (last_train, last_val) or (None, None) on error."""
+    last_train: dict[str, Any] | None = None
+    last_val: dict[str, Any] | None = None
+    try:
+        with open(metrics_path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row: dict[str, Any] = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                split = row.get("split")
+                if split == "train":
+                    last_train = row
+                elif split == "val":
+                    last_val = row
+    except Exception:
+        pass
+    return last_train, last_val
+
+
+def _list_runs() -> list[dict[str, Any]]:
+    """List all runs from DONGFENG_RUNS_DIR, newest first (by started field / mtime)."""
+    root = _runs_root()
+    results: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return results
+    for run_dir in root.iterdir():
+        if not run_dir.is_dir():
+            continue
+        data = _read_run_json(run_dir)
+        if data is None:
+            continue
+        metrics_path = run_dir / "metrics.jsonl"
+        last_train, last_val = _read_last_metrics(metrics_path)
+        data["last_train"] = last_train
+        data["last_val"] = last_val
+        results.append(data)
+
+    # Sort by "started" desc; fall back to mtime of run.json for stability.
+    def _sort_key(r: dict[str, Any]) -> str:
+        started = r.get("started") or ""
+        if not started:
+            rj = _runs_root() / str(r.get("id", "")) / "run.json"
+            try:
+                started = str(rj.stat().st_mtime)
+            except Exception:
+                started = ""
+        return started
+
+    results.sort(key=_sort_key, reverse=True)
+    return results
+
+
+def _downsample(rows: list[dict[str, Any]], max_pts: int = 500) -> list[dict[str, Any]]:
+    """Uniformly downsample a list to at most max_pts entries."""
+    n = len(rows)
+    if n <= max_pts:
+        return rows
+    stride = n / max_pts
+    return [rows[int(i * stride)] for i in range(max_pts)]
+
+
+def _get_run_detail(run_id: str) -> tuple[dict[str, Any], int]:
+    """Return (response_dict, http_status) for GET /api/training?id=<run_id>."""
+    root = _runs_root()
+    run_dir = root / run_id
+    if not run_dir.is_dir():
+        return {"error": f"run not found: {run_id}"}, 404
+    data = _read_run_json(run_dir)
+    if data is None:
+        return {"error": f"run.json missing or invalid for: {run_id}"}, 404
+    train_rows: list[dict[str, Any]] = []
+    val_rows: list[dict[str, Any]] = []
+    metrics_path = run_dir / "metrics.jsonl"
+    try:
+        with open(metrics_path) as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row: dict[str, Any] = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                split = row.get("split")
+                if split == "train":
+                    train_rows.append(row)
+                elif split == "val":
+                    val_rows.append(row)
+    except Exception:
+        pass
+    metrics = _downsample(train_rows) + _downsample(val_rows)
+    return {"run": data, "metrics": metrics}, 200
+
+
 def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - matches base
@@ -160,6 +286,15 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(body)
             elif self.path == "/api/state":
                 self._send_json(session.state())
+            elif self.path == "/api/training" or self.path.startswith("/api/training?"):
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                run_id_list = qs.get("id")
+                if run_id_list:
+                    resp, status = _get_run_detail(run_id_list[0])
+                    self._send_json(resp, status)
+                else:
+                    self._send_json({"runs": _list_runs()})
             else:
                 self.send_error(404)
 
@@ -219,8 +354,12 @@ _HTML = r"""<!doctype html>
   :root { --wood:#e8c48c; --line:#5b3a1a; --red:#c0392b; --black:#1c1c1c; --cream:#f4e4c1; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
-         background:#2b2b2b; color:#eee; display:flex; justify-content:center; padding:16px; }
-  .wrap { display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start; }
+         background:#2b2b2b; color:#eee; display:flex; flex-direction:column; align-items:center; padding:16px; }
+  .tabs { display:flex; gap:4px; margin-bottom:12px; }
+  .tab-btn { background:#444; border:none; color:#ccc; padding:8px 20px; border-radius:6px 6px 0 0; cursor:pointer; font-size:14px; font-weight:600; }
+  .tab-btn.active { background:#c0392b; color:#fff; }
+  .tab-content { display:none; }
+  .tab-content.active { display:flex; gap:20px; flex-wrap:wrap; align-items:flex-start; }
   h1 { font-size:20px; margin:0 0 10px; }
   #board { background:var(--wood); border-radius:6px; box-shadow:0 6px 24px rgba(0,0,0,.5); touch-action:manipulation; }
   .panel { min-width:230px; max-width:280px; }
@@ -237,10 +376,29 @@ _HTML = r"""<!doctype html>
            overflow:auto; white-space:pre-wrap; line-height:1.5; }
   .row { display:flex; gap:8px; }
   .muted { color:#999; font-size:12px; }
+  /* Training panel styles */
+  #training-panel { width:100%; max-width:900px; }
+  #training-panel .card { max-width:100%; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+  .chip { background:#222; border-radius:20px; padding:4px 12px; font-size:12px; color:#ccc; border:1px solid #555; }
+  .chip span { color:#fff; font-weight:600; }
+  #training-chart { display:block; width:100%; height:280px; background:#1a1a1a; border-radius:6px; }
+  .legend { display:flex; gap:16px; margin-top:6px; font-size:12px; }
+  .legend-item { display:flex; align-items:center; gap:6px; }
+  .legend-dot { width:14px; height:4px; border-radius:2px; }
+  #training-run-select { margin-bottom:8px; }
+  .status-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+  .status-running { background:#2255aa; color:#adf; }
+  .status-done { background:#225533; color:#afd; }
+  .status-failed { background:#552222; color:#faa; }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchTab('play')">Cờ tướng</button>
+  <button class="tab-btn" onclick="switchTab('training')" id="tab-training-btn">Training</button>
+</div>
+<div id="tab-play" class="tab-content active">
   <div>
     <h1>东风 · Dong Feng — Cờ tướng</h1>
     <svg id="board" width="540" height="600" viewBox="0 0 540 600"></svg>
@@ -254,6 +412,7 @@ _HTML = r"""<!doctype html>
       <label>Đối thủ (engine)</label>
       <select id="engine">
         <option value="neural">Neural (model đã train)</option>
+        <option value="board">Board transformer</option>
         <option value="random">Random (baseline)</option>
       </select>
       <label>Bạn cầm quân</label>
@@ -275,7 +434,43 @@ _HTML = r"""<!doctype html>
     <div class="muted">Bấm quân của bạn rồi bấm ô đích. Chấm xanh = nước hợp lệ.</div>
   </div>
 </div>
+<div id="tab-training" class="tab-content" id="training-panel">
+  <div style="width:100%;max-width:900px;">
+    <h1>Training Dashboard</h1>
+    <div class="card">
+      <label>Training run</label>
+      <select id="training-run-select" onchange="selectRun(this.value)">
+        <option value="">-- chọn run --</option>
+      </select>
+    </div>
+    <div class="card" id="training-stats-card" style="display:none;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+        <strong id="training-run-id" style="font-size:15px;"></strong>
+        <span id="training-status-badge" class="status-badge"></span>
+      </div>
+      <div class="chips" id="training-chips"></div>
+    </div>
+    <div class="card" id="training-chart-card" style="display:none;">
+      <label>Loss vs Step</label>
+      <canvas id="training-chart"></canvas>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#4da6ff;"></div>Train loss</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#ff7043;"></div>Val loss</div>
+      </div>
+    </div>
+  </div>
+</div>
 <script>
+// ---- Tab switching ----
+function switchTab(name){
+  document.querySelectorAll(".tab-content").forEach(el=>el.classList.remove("active"));
+  document.querySelectorAll(".tab-btn").forEach(el=>el.classList.remove("active"));
+  document.getElementById("tab-"+name).classList.add("active");
+  event.target.classList.add("active");
+  if(name==="training") loadTrainingList();
+}
+
+// ---- Board play ----
 const FILES = "abcdefghi";
 const RED = {K:"帅",A:"仕",B:"相",N:"马",R:"车",C:"炮",P:"兵"};
 const BLACK = {k:"将",a:"士",b:"象",n:"马",r:"车",c:"炮",p:"卒"};
@@ -389,6 +584,119 @@ document.getElementById("new").addEventListener("click",newGame);
 document.getElementById("undo").addEventListener("click",undo);
 document.getElementById("temp").addEventListener("input",e=>document.getElementById("tval").textContent=e.target.value);
 refresh();
+
+// ---- Training dashboard ----
+let _trainingPollTimer = null;
+let _currentRunId = null;
+
+async function loadTrainingList(){
+  try {
+    const resp = await fetch("/api/training");
+    const data = await resp.json();
+    const sel = document.getElementById("training-run-select");
+    sel.innerHTML = '<option value="">-- chọn run --</option>';
+    for(const run of (data.runs||[])){
+      const opt = document.createElement("option");
+      opt.value = run.id||"";
+      const st = run.status||"";
+      const lt = run.last_train;
+      const step = lt ? lt.step : "?";
+      opt.textContent = `${run.id||"?"} [${st}] preset=${run.preset||"?"} step=${step}`;
+      sel.appendChild(opt);
+    }
+  } catch(e){ console.error("training list error",e); }
+}
+
+function selectRun(runId){
+  if(_trainingPollTimer){ clearInterval(_trainingPollTimer); _trainingPollTimer=null; }
+  _currentRunId = runId;
+  if(!runId){ document.getElementById("training-stats-card").style.display="none"; document.getElementById("training-chart-card").style.display="none"; return; }
+  fetchRunDetail(runId);
+}
+
+async function fetchRunDetail(runId){
+  try {
+    const resp = await fetch("/api/training?id="+encodeURIComponent(runId));
+    const data = await resp.json();
+    if(data.error){ console.error("run detail error",data.error); return; }
+    renderTrainingDetail(data.run, data.metrics||[]);
+    // Poll every 2s while running
+    if(data.run.status==="running"){
+      if(!_trainingPollTimer){
+        _trainingPollTimer = setInterval(()=>{ if(_currentRunId===runId) fetchRunDetail(runId); else clearInterval(_trainingPollTimer); }, 2000);
+      }
+    } else {
+      if(_trainingPollTimer){ clearInterval(_trainingPollTimer); _trainingPollTimer=null; }
+    }
+  } catch(e){ console.error("fetchRunDetail error",e); }
+}
+
+function renderTrainingDetail(run, metrics){
+  document.getElementById("training-stats-card").style.display="";
+  document.getElementById("training-chart-card").style.display="";
+  document.getElementById("training-run-id").textContent = run.id||"";
+  const badge = document.getElementById("training-status-badge");
+  const st = run.status||"";
+  badge.textContent = st;
+  badge.className = "status-badge status-"+st;
+  // stat chips
+  const trainMetrics = metrics.filter(m=>m.split==="train");
+  const valMetrics = metrics.filter(m=>m.split==="val");
+  const last = trainMetrics.length ? trainMetrics[trainMetrics.length-1] : null;
+  const lastVal = valMetrics.length ? valMetrics[valMetrics.length-1] : null;
+  const chips = document.getElementById("training-chips");
+  const fmt = (v,d=4)=> v==null?"—":Number(v).toFixed(d);
+  chips.innerHTML = [
+    ["preset", run.preset||"—"],
+    ["params", run.params!=null ? Number(run.params).toLocaleString() : "—"],
+    ["step", last ? last.step : "—"],
+    ["lr", last ? fmt(last.lr,6) : "—"],
+    ["top1", lastVal ? fmt(lastVal.top1,3) : (last ? fmt(last.top1,3) : "—")],
+    ["samples/s", last ? fmt(last.samples_per_s,1) : "—"],
+    ["status", st],
+  ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
+  // draw chart
+  drawLossChart(trainMetrics, valMetrics);
+}
+
+function drawLossChart(trainRows, valRows){
+  const canvas = document.getElementById("training-chart");
+  const dpr = window.devicePixelRatio||1;
+  const W = canvas.offsetWidth||800, H = canvas.offsetHeight||280;
+  canvas.width = W*dpr; canvas.height = H*dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0,0,W,H);
+  const PAD = {l:50,r:20,t:16,b:36};
+  const cw = W-PAD.l-PAD.r, ch = H-PAD.t-PAD.b;
+  const allRows = [...trainRows,...valRows];
+  if(!allRows.length){ ctx.fillStyle="#666"; ctx.font="14px system-ui"; ctx.fillText("No metrics yet.",PAD.l+20,H/2); return; }
+  const allLoss = allRows.map(r=>r.loss).filter(v=>v!=null&&isFinite(v));
+  const allSteps = allRows.map(r=>r.step).filter(v=>v!=null&&isFinite(v));
+  const minL=Math.min(...allLoss), maxL=Math.max(...allLoss);
+  const minS=Math.min(...allSteps), maxS=Math.max(...allSteps);
+  const lRange = maxL-minL||1, sRange = maxS-minS||1;
+  function xp(s){ return PAD.l + (s-minS)/sRange*cw; }
+  function yp(l){ return PAD.t + (1-(l-minL)/lRange)*ch; }
+  // axes
+  ctx.strokeStyle="#555"; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(PAD.l,PAD.t); ctx.lineTo(PAD.l,PAD.t+ch); ctx.lineTo(PAD.l+cw,PAD.t+ch); ctx.stroke();
+  // y labels
+  ctx.fillStyle="#888"; ctx.font="11px system-ui"; ctx.textAlign="right";
+  for(let i=0;i<=4;i++){ const v=minL+lRange*i/4; const y=yp(v); ctx.fillText(v.toFixed(3),PAD.l-4,y+4); ctx.strokeStyle="#333"; ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(PAD.l+cw,y); ctx.stroke(); }
+  // x labels
+  ctx.textAlign="center"; ctx.fillStyle="#888";
+  for(let i=0;i<=4;i++){ const s=Math.round(minS+sRange*i/4); const x=xp(s); ctx.fillText(s,x,PAD.t+ch+20); }
+  // draw lines
+  function drawLine(rows, color){
+    if(!rows.length) return;
+    ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+    rows.forEach((r,i)=>{ const x=xp(r.step), y=yp(r.loss); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+    ctx.stroke();
+  }
+  drawLine(trainRows, "#4da6ff");
+  drawLine(valRows, "#ff7043");
+}
 </script>
 </body>
 </html>

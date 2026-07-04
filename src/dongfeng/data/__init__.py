@@ -6,6 +6,9 @@ Public surface:
     parse_file / iter_games_in      -- extension-dispatching ingestion (M1)
     build_shards / iter_samples     -- dataset building (M1)
     BuildStats                      -- summary of a shard build
+    build_board_shards              -- board-state dataset building (M3.5 / WP1)
+    load_board_arrays               -- load board shards as numpy arrays
+    BoardBuildStats                 -- summary of a board shard build
 
 The parsers delegate to the ``cchess`` backend; the dataset builder emits
 autoregressive ``uint16`` token shards plus a ``dataset_meta.json``.
@@ -14,6 +17,7 @@ autoregressive ``uint16`` token shards plus a ``dataset_meta.json``.
 from __future__ import annotations
 
 from .base import Game, GameSource, Sample
+from .board_dataset import BoardBuildStats, build_board_shards, load_board_arrays
 from .dataset import BuildStats, build_shards, iter_samples
 from .ingest import (
     iter_games_in,
@@ -29,13 +33,16 @@ from .ingest import (
 )
 
 __all__ = [
+    "BoardBuildStats",
     "BuildStats",
     "Game",
     "GameSource",
     "Sample",
+    "build_board_shards",
     "build_shards",
     "iter_games_in",
     "iter_samples",
+    "load_board_arrays",
     "parse_cbf",
     "parse_cbl",
     "parse_cbr",

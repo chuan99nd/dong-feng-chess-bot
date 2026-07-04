@@ -51,9 +51,7 @@ class BoardTokenizer:
     def __init__(self) -> None:
         # id layout: [specials..] [empty] [pieces..] [side_red] [side_black]
         symbols = [_EMPTY, *_PIECES, _SIDE_RED, _SIDE_BLACK]
-        self._sym_to_id: dict[str, int] = {
-            s: i + self._NUM_SPECIAL for i, s in enumerate(symbols)
-        }
+        self._sym_to_id: dict[str, int] = {s: i + self._NUM_SPECIAL for i, s in enumerate(symbols)}
         self._id_to_sym: dict[int, str] = {v: k for k, v in self._sym_to_id.items()}
 
     # -- Tokenizer protocol -------------------------------------------------

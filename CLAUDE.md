@@ -49,7 +49,11 @@ Everything runs through `uv`. There is no `pip install`; use `uv sync`.
 | `uv run dfc ucci`                          | Speak the UCCI/UCI text protocol on stdin/stdout.        |
 | `uv run dfc eval ...`                      | Run an Elo arena / strength eval (M2+).                  |
 | `uv run dfc data ...`                      | Corpus ingestion + tokenization (M1).                    |
+| `uv run dfc data ingest-board ...`         | Ingest → fixed-length 91-token board shards (M3.5).      |
 | `uv run dfc train ...` / `dfc distill ...` | Training / teacher distillation (M2/M4).                 |
+| `uv run dfc train-board --preset m1-dev\|mid\|1b [--smoke]` | Train the board-state transformer (M3.5).  |
+| `uv run dfc eval arena --engine-kind board --ckpt ...` | Arena the board engine vs a baseline.        |
+| `uv run dfc web --engine board`            | Play the board engine in the browser; Training tab shows live metrics. |
 | `uv run pytest`                            | Full test suite.                                         |
 | `uv run pytest -q tests/test_protocol_conformance.py` | Just the engine-contract tests.              |
 | `uv run ruff format && uv run ruff check --fix` | Format + lint autofix.                             |
@@ -90,6 +94,8 @@ run those manually after edits in those areas.
 | Speak/serve UCCI                        | `docs/protocol/UCCI.md`                          | `uv run dfc ucci`                            |
 | Drive Pikafish as a teacher/opponent    | `docs/protocol/pikafish-uci.md`                  | —                                            |
 | Know why an architecture choice was made| `docs/adr/`                                       | —                                            |
+| Understand the board-state flagship     | `docs/adr/0005-board-state-flagship.md`, `model/board_transformer.py` | —                       |
+| Train the 1B model on a cloud GPU       | `docs/training-1b.md`                             | `uv run dfc train-board --preset 1b`         |
 | See what milestone something belongs to | `ROADMAP.md`                                       | —                                            |
 | Check dataset stats                     | **do not read data files** — see below           | `dfc data stats` / MCP `dataset_stats`       |
 | Check a checkpoint's metadata           | **do not read checkpoints** — see below          | `dfc ckpt info` / MCP `checkpoint_info`      |

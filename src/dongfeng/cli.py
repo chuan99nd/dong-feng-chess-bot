@@ -28,7 +28,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .core import STARTING_FEN, Board, GameResult, Move, new_board
-from .data import build_shards, iter_games_in
+from .data import build_board_shards, build_shards, iter_games_in
 from .engines import PikafishEngine, RandomEngine
 from .protocol.engine import Engine, SearchLimits
 from .protocol.ucci import ProtocolAdapter
@@ -45,14 +45,16 @@ _console = Console()
 
 # -- engine factory ---------------------------------------------------------
 
-_ENGINE_CHOICES = ("random", "pikafish", "neural")
+_ENGINE_CHOICES = ("random", "pikafish", "neural", "board")
 
 
 def _make_engine(name: str, seed: int | None = None) -> Engine:
-    """Build an :class:`Engine` by short name (``random`` / ``pikafish`` / ``neural``).
+    """Build an :class:`Engine` by short name (``random`` / ``pikafish`` / ``neural`` / ``board``).
 
     ``neural`` loads a trained checkpoint from ``$DONGFENG_CKPT`` (or a random-init
     model if unset); it needs the optional ``model`` extra (torch).
+    ``board`` loads a board-state transformer checkpoint from ``$DONGFENG_BOARD_CKPT``
+    (or a random-init model if unset); it also needs the ``model`` extra.
     """
     key = name.lower()
     if key == "random":
@@ -63,6 +65,13 @@ def _make_engine(name: str, seed: int | None = None) -> Engine:
         from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
 
         return TransformerEngine(os.environ.get("DONGFENG_CKPT") or None)
+    if key == "board":
+        from .inference.board_engine import BoardTransformerEngine  # noqa: PLC0415
+
+        return BoardTransformerEngine(
+            checkpoint=os.environ.get("DONGFENG_BOARD_CKPT") or None,
+            device="auto",
+        )
     raise typer.BadParameter(f"unknown engine {name!r}; choose one of {', '.join(_ENGINE_CHOICES)}")
 
 
@@ -317,6 +326,56 @@ def data_ingest(
     _console.print(f"Shards + dataset_meta.json written to [bold]{out}[/bold]")
 
 
+@data_app.command("ingest-board")
+def data_ingest_board(
+    path: str = typer.Argument(..., help="Game file or directory (.pgn/.xqf/.cbf/.cbl/.cbr/.txt)."),
+    out: str = typer.Option(..., "--out", help="Output dir for board shards (under data/)."),
+    dataset_id: str = typer.Option(..., "--id", help="Unique dataset id for the manifest."),
+    shard_size: int = typer.Option(1_000_000, "--shard-size", help="Max samples per shard."),
+) -> None:
+    """Parse games, encode per-ply board-state shards, and index in the manifest (WP5)."""
+    created = datetime.now(UTC).isoformat(timespec="seconds")
+    stats = build_board_shards(iter_games_in(path), out, shard_size=shard_size, created=created)
+    m = _load_manifest()
+    # Register both tokenizers; board-v1 may be missing if no prior ingest-board was run.
+    _register_tokenizers(m)
+    _upsert_dataset(
+        m,
+        {
+            "id": dataset_id,
+            "path": out,
+            "source": Path(path).name,
+            "format": "board-ds-v1",
+            "schema": "board-ds-v1",
+            "num_games": stats.num_games,
+            "num_samples": stats.num_samples,
+            "skipped": stats.skipped_games,
+            "tokenizer": BoardTokenizer.id,
+            "created": created,
+            "notes": (
+                f"{stats.num_samples} samples across {len(stats.shards)} shard(s); "
+                f"{stats.skipped_games} game(s) skipped; move_tokenizer {MoveTokenizer.id}"
+            ),
+        },
+    )
+    _save_manifest(m)
+
+    table = Table(title=f"Ingested board dataset {dataset_id!r}")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for label, value in (
+        ("Games", stats.num_games),
+        ("Plies (samples)", stats.num_samples),
+        ("Shards", len(stats.shards)),
+        ("Skipped games", stats.skipped_games),
+        ("Board tokenizer", BoardTokenizer.id),
+        ("Move tokenizer", MoveTokenizer.id),
+    ):
+        table.add_row(label, str(value))
+    _console.print(table)
+    _console.print(f"Shards + board_meta.json written to [bold]{out}[/bold]")
+
+
 @data_app.command("stats")
 def data_stats(
     dataset_id: str | None = typer.Option(None, "--id", help="Show only this dataset."),
@@ -359,9 +418,7 @@ def data_stats(
 
 @data_app.command("tokenize")
 def data_tokenize(
-    text: str = typer.Argument(
-        ..., help="ICCS move(s) like 'h2e2 h9g7', or a FEN with --board."
-    ),
+    text: str = typer.Argument(..., help="ICCS move(s) like 'h2e2 h9g7', or a FEN with --board."),
     board_mode: bool = typer.Option(
         False, "--board", help="Treat input as a FEN (BoardTokenizer)."
     ),
@@ -456,6 +513,152 @@ def train(
     _console.print(f"[bold green]Saved[/bold green] checkpoint to {ckpt}")
 
 
+@app.command("train-board")
+def train_board(
+    data_dir: str = typer.Option("", "--data", help="Board shard dir. Not needed for --smoke."),
+    out: str = typer.Option("", "--out", help="Output dir (default: runs/<id>)."),
+    checkpoint_id: str = typer.Option("board-run", "--id", help="Run/checkpoint id."),
+    preset: str = typer.Option("m1-dev", "--preset", help="Model preset: m1-dev | mid | 1b."),
+    max_steps: int = typer.Option(100_000, "--steps"),
+    batch_size: int = typer.Option(256, "--batch"),
+    lr: float = typer.Option(3e-4, "--lr"),
+    warmup: int = typer.Option(1_000, "--warmup"),
+    device: str = typer.Option("auto", "--device", help="auto | cpu | mps | cuda"),
+    seed: int = typer.Option(0, "--seed"),
+    value_weight: float = typer.Option(0.5, "--value-weight"),
+    grad_checkpoint: bool = typer.Option(False, "--grad-checkpoint/--no-grad-checkpoint"),
+    eval_every: int = typer.Option(1_000, "--eval-every"),
+    optim: str = typer.Option(
+        "adamw",
+        "--optim",
+        help="Optimizer: adamw (default) or adam8bit (cuda-only; needs bitsandbytes).",
+    ),
+    smoke: bool = typer.Option(
+        False, "--smoke", help="Build model, 2 fwd+bwd on random data, print params, exit 0."
+    ),
+) -> None:
+    """Behavior-cloning pretrain of the board-state transformer (WP5 / M3.5).
+
+    Use ``--smoke`` to verify the model builds and forward/backward passes run (e.g. for 1B
+    verification) without needing a dataset.
+    """
+    try:
+        import torch  # noqa: PLC0415
+    except ModuleNotFoundError:
+        _console.print("[red]torch is not installed.[/red]  Install with:  uv sync --extra model")
+        raise typer.Exit(1) from None
+
+    from .model.board_transformer import BoardTransformer, BoardTransformerConfig  # noqa: PLC0415
+    from .training.board_loop import (  # noqa: PLC0415
+        BoardTrainConfig,
+        bc_train_board,
+        resolve_device_dtype,
+    )
+
+    if smoke:
+        # --- smoke mode: build preset model, run 2 fwd+bwd, print params, exit 0 ---
+        presets = BoardTransformerConfig.presets()
+        if preset not in presets:
+            _console.print(f"[red]Unknown preset {preset!r}. Choose from: {list(presets)}[/red]")
+            raise typer.Exit(1)
+        model_cfg = presets[preset]
+        resolved_device, dtype = resolve_device_dtype(device)
+        torch.manual_seed(seed)
+        model = BoardTransformer(model_cfg)
+        model.to(resolved_device)
+        model.train()
+        n_params = model.num_params()
+        _console.print(
+            f"[bold]Smoke test[/bold] preset={preset!r}  params={n_params:,}  "
+            f"device={resolved_device}  dtype={str(dtype).replace('torch.', '')}"
+        )
+        import torch.nn.functional as F  # noqa: PLC0415
+
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        B = 4
+        for step in range(2):
+            boards = torch.randint(0, 21, (B, 91), device=resolved_device)
+            moves = torch.randint(0, 2554, (B,), device=resolved_device)
+            _values = torch.randint(-1, 2, (B,), device=resolved_device).long()
+            policy_logits, value_pred = model(boards)
+            loss = F.cross_entropy(policy_logits, moves)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            _console.print(f"  step {step}: loss={loss.item():.4f}")
+        if resolved_device.startswith("cuda"):
+            peak_mb = torch.cuda.max_memory_allocated(resolved_device) / 1_048_576
+            _console.print(f"  peak CUDA memory: {peak_mb:.1f} MB")
+        _console.print(f"[bold green]Smoke OK[/bold green]  params={n_params:,}")
+        return
+
+    # --- normal training mode ---
+    if not data_dir:
+        _console.print("[red]--data is required (unless --smoke is set).[/red]")
+        raise typer.Exit(1)
+
+    resolved_out = out if out else f"runs/{checkpoint_id}"
+    resolved_device, _ = resolve_device_dtype(device)
+    _console.print(
+        f"Training board model [bold]{checkpoint_id!r}[/bold] "
+        f"preset={preset!r} steps={max_steps} device={resolved_device}"
+    )
+
+    cfg = BoardTrainConfig(
+        data_dir=Path(data_dir),
+        out_dir=Path(resolved_out),
+        preset=preset,
+        id=checkpoint_id,
+        batch_size=batch_size,
+        lr=lr,
+        warmup=warmup,
+        max_steps=max_steps,
+        value_weight=value_weight,
+        device=device,
+        seed=seed,
+        grad_checkpoint=grad_checkpoint,
+        eval_every=eval_every,
+        optim=optim,
+    )
+    ckpt = bc_train_board(cfg)
+
+    created = datetime.now(UTC).isoformat(timespec="seconds")
+    m = _load_manifest()
+    # Report num_params via a fresh model build (no weights loaded).
+    presets = BoardTransformerConfig.presets()
+    model_cfg = presets.get(preset)
+    n_params: int | None = None
+    if model_cfg is not None:
+        try:
+            _model = BoardTransformer(model_cfg)
+            n_params = _model.num_params()
+        except Exception:  # noqa: BLE001
+            pass
+
+    checkpoints = m.setdefault("checkpoints", [])
+    entry: dict[str, Any] = {
+        "id": checkpoint_id,
+        "path": str(ckpt),
+        "kind": "bc-board",
+        "preset": preset,
+        "params": n_params,
+        "step": max_steps,
+        "run_id": checkpoint_id,
+        "tokenizer": BoardTokenizer.id,
+        "metrics": {},
+        "created": created,
+    }
+    for i, c in enumerate(checkpoints):
+        if c.get("id") == checkpoint_id:
+            checkpoints[i] = entry
+            break
+    else:
+        checkpoints.append(entry)
+    _save_manifest(m)
+    _console.print(f"[bold green]Saved[/bold green] checkpoint to {ckpt}")
+    _console.print(f"Run dir: [bold]{resolved_out}[/bold]")
+
+
 eval_app = typer.Typer(
     name="eval", help="Strength & accuracy evaluation (M2+).", no_args_is_help=True
 )
@@ -476,28 +679,39 @@ def eval_accuracy(
     engine = TransformerEngine(ckpt, device=device)
     res = move_accuracy(engine, iter_games_in(data), max_positions=max_positions)
     _console.print(
-        f"top-1 accuracy: [bold]{res.top1_acc:.1%}[/bold] "
-        f"({res.top1}/{res.positions} positions)"
+        f"top-1 accuracy: [bold]{res.top1_acc:.1%}[/bold] ({res.top1}/{res.positions} positions)"
     )
 
 
 @eval_app.command("arena")
 def eval_arena(
-    ckpt: str = typer.Option(..., "--ckpt", help="Checkpoint path for the neural engine."),
+    ckpt: str = typer.Option(..., "--ckpt", help="Checkpoint path for the engine under test."),
     games: int = typer.Option(20, "--games"),
     opponent: str = typer.Option("random", "--opponent"),
     device: str = typer.Option("cpu", "--device"),
     seed: int = typer.Option(0, "--seed"),
+    engine_kind: str = typer.Option(
+        "neural", "--engine-kind", help="Engine under test: neural | board."
+    ),
 ) -> None:
-    """Play the neural engine vs a baseline and report W/D/L + estimated Elo."""
+    """Play the engine under test vs a baseline and report W/D/L + estimated Elo."""
     from .eval import play_match  # noqa: PLC0415
-    from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
 
-    neural = TransformerEngine(ckpt, device=device)
+    if engine_kind == "board":
+        from .inference.board_engine import BoardTransformerEngine  # noqa: PLC0415
+
+        under_test: Engine = BoardTransformerEngine(checkpoint=ckpt, device=device)
+    elif engine_kind == "neural":
+        from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
+
+        under_test = TransformerEngine(ckpt, device=device)
+    else:
+        raise typer.BadParameter(f"unknown engine-kind {engine_kind!r}; choose neural | board")
+
     baseline = _make_engine(opponent, seed=seed)
-    res = play_match(neural, baseline, games=games, limits=SearchLimits(movetime_ms=10))
+    res = play_match(under_test, baseline, games=games, limits=SearchLimits(movetime_ms=10))
     _console.print(
-        f"neural vs {opponent}: [bold]{res.wins}W-{res.draws}D-{res.losses}L[/bold] "
+        f"{engine_kind} vs {opponent}: [bold]{res.wins}W-{res.draws}D-{res.losses}L[/bold] "
         f"(score {res.score:.1%}, Elo diff {res.elo_diff:+.0f})"
     )
 

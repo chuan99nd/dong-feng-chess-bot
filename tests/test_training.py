@@ -24,8 +24,9 @@ def test_bc_pretrain_writes_loadable_checkpoint(tmp_path: Path) -> None:
     build_shards(games, data_dir)
 
     model = TransformerPolicy(
-        TransformerConfig(vocab_size=MoveTokenizer().vocab_size, n_layer=1, n_embd=32, n_head=2,
-                          block_size=16)
+        TransformerConfig(
+            vocab_size=MoveTokenizer().vocab_size, n_layer=1, n_embd=32, n_head=2, block_size=16
+        )
     )
     cfg = TrainConfig(
         data_dir=data_dir,

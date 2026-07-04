@@ -170,9 +170,7 @@ def _dhtmlxq_moves(movelist: str) -> list[Move]:
     moves: list[Move] = []
     for i in range(0, len(movelist) - 3, 4):
         c = movelist[i : i + 4]
-        moves.append(
-            Move(_dhtmlxq_cell(int(c[0]), int(c[1])), _dhtmlxq_cell(int(c[2]), int(c[3])))
-        )
+        moves.append(Move(_dhtmlxq_cell(int(c[0]), int(c[1])), _dhtmlxq_cell(int(c[2]), int(c[3]))))
     return moves
 
 

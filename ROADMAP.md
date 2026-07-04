@@ -76,6 +76,36 @@ Make the model a first-class, playable engine.
 **Exit:** `dfc ucci` serves the neural engine to a real GUI; it plays a full legal
 game vs. Pikafish through the adapter.
 
+## M3.5 — Board-state flagship + scale-first training  ✅
+
+A second, scale-first flagship (see [ADR-0005](docs/adr/0005-board-state-flagship.md)):
+position-in / move-out, portable across Apple MPS and RTX 5090 CUDA, sized 22M→1B
+by a single preset knob.
+
+- ✅ `data/board_dataset.py`: fixed-length **91-token** board shards
+  (`boards/moves/values` `.bin` + `board_meta.json`, schema `board-ds-v1`);
+  value targets from game result, masked (127) when absent.
+- ✅ `model/board_transformer.py`: encoder-only bidirectional transformer
+  (RMSNorm, SwiGLU, 2D positional embedding); presets `m1-dev` (~22M),
+  `mid` (~144M), `1b` (~1.02B); policy + `tanh` value heads.
+- ✅ `training/board_loop.py`: `bc_train_board` with `resolve_device_dtype`
+  (cuda→bf16, mps→fp16, cpu→fp32), NaN guard, `run.json` + `metrics.jsonl`,
+  best-by-val checkpoint; optional `--optim adam8bit` (cuda-only, bitsandbytes,
+  graceful AdamW fallback).
+- ✅ `inference/board_engine.py`: `BoardTransformerEngine` behind the `Engine`
+  Protocol; legal-move-masked policy; `win_prob = (value + 1) / 2`; conformant.
+- ✅ CLI: `dfc data ingest-board`, `dfc train-board --preset … [--smoke]`,
+  `dfc eval arena --engine-kind board`; web UI **Training** tab (live
+  `metrics.jsonl` chart, 2s polling); `dfc web --engine board`.
+- ✅ 5090 cloud runbook ([docs/training-1b.md](docs/training-1b.md)): VRAM budget,
+  hyperparameters, rsync-back-metrics, and why 1B is smoke-verified but not yet
+  trained to convergence (corpus ≪ Chinchilla-optimal).
+
+**Exit:** ✅ `dfc data ingest-board` → real shards; `dfc train-board --preset
+m1-dev` trains on MPS (val loss ↓, top1 ↑); the board engine passes conformance
+and holds its own vs. random in the arena; `--smoke --preset 1b` verifies the 1B
+architecture on-device.
+
 ## M4 — Scale + distill / Elo  ⬜
 
 Stronger and controllable.
