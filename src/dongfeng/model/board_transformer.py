@@ -19,6 +19,13 @@ Architecture details (pinned by §1.1–1.2 of docs/plans/board-1b.md):
 * :func:`F.scaled_dot_product_attention` with ``is_causal=False``.
 * Optional ``gradient_checkpointing`` wraps each block in
   :func:`torch.utils.checkpoint.checkpoint`.
+* Optional **additive 2D relative-position bias heads** (``n_bias_head``,
+  default ``0``): each block gains ``n_bias_head`` *extra* attention heads (on
+  top of the ``n_head`` content heads, whose ``head_dim`` is unchanged) carrying
+  a per-layer learnable bias table indexed by the (Δfile, Δrank) between board
+  squares. Zero-initialised, so ``n_bias_head=0`` is byte-identical to the
+  content-only model and any ``k>0`` starts as plain extra heads that only
+  diverge if training finds the geometry useful ("do no harm").
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ class BoardTransformerConfig:
     d_model: int = 384
     n_layer: int = 12
     n_head: int = 6
+    n_bias_head: int = 0  # extra attention heads carrying a learnable 2D rel-pos bias
     ffn_hidden: int = 1024
     vocab_size: int = 21  # board-v1 token vocabulary
     seq_len: int = 91  # 90 board squares + 1 side-to-move token
@@ -58,6 +66,39 @@ class BoardTransformerConfig:
             "mid": cls(d_model=768, n_layer=20, n_head=12, ffn_hidden=2048),
             "1b": cls(d_model=1536, n_layer=36, n_head=12, ffn_hidden=4096),
         }
+
+
+# ---------------------------------------------------------------------------
+# Relative-position bias index
+# ---------------------------------------------------------------------------
+
+# Bias table size: (Δfile ∈ -8..8 → 17 values) × (Δrank ∈ -9..9 → 19 values) + 1
+# extra bucket for any pair touching the side-to-move token (index 90).
+_REL_N_FILE = 17  # Δfile + 8 ∈ 0..16
+_REL_N_RANK = 19  # Δrank + 9 ∈ 0..18
+_REL_TABLE_SIZE = _REL_N_FILE * _REL_N_RANK + 1  # 17*19 + 1 = 324
+_REL_SIDE_BUCKET = _REL_TABLE_SIZE - 1  # 323 — any pair involving the side token
+
+
+def _build_rel_index(seq_len: int = 91) -> torch.Tensor:
+    """Build the ``[seq_len, seq_len]`` long bias-bucket index for board squares.
+
+    For a board–board pair (query ``i``, key ``j`` both < 90) the bucket is
+    ``(Δfile + 8) * 19 + (Δrank + 9)`` where ``Δfile = file_i - file_j`` and
+    ``Δrank = rank_i - rank_j``. Board coords from seq index: ``file = i % 9`` and
+    ``iccs_rank = 9 - i // 9``. Any pair touching the side token (index 90) maps
+    to bucket ``323``.
+    """
+    idx = torch.arange(seq_len)
+    is_side = idx >= 90  # index 90 is the side-to-move token
+    file = idx % 9  # only meaningful for board squares (< 90)
+    rank = 9 - idx // 9  # iccs rank
+    dfile = file[:, None] - file[None, :]  # [T, T]
+    drank = rank[:, None] - rank[None, :]  # [T, T]
+    bucket = (dfile + 8) * _REL_N_RANK + (drank + 9)
+    touches_side = is_side[:, None] | is_side[None, :]
+    bucket = torch.where(touches_side, torch.full_like(bucket, _REL_SIDE_BUCKET), bucket)
+    return bucket.long()
 
 
 # ---------------------------------------------------------------------------
@@ -94,27 +135,57 @@ class _SwiGLU(nn.Module):
 
 
 class _BidirectionalAttention(nn.Module):
-    """Multi-head self-attention without causal mask (encoder-style), no biases."""
+    """Multi-head self-attention without causal mask (encoder-style), no biases.
+
+    Content heads (``n_head`` of them, ``head_dim = d_model // n_head``) behave
+    exactly as before. When ``n_bias_head > 0`` we add that many *extra* heads on
+    top, each with its own ``head_dim``-wide q/k/v projection, and add a learnable
+    additive 2D relative-position bias (per layer) to their attention scores. The
+    content heads receive a zero bias. ``n_bias_head == 0`` takes the fast path
+    with no attn mask and is byte-identical to the content-only model.
+    """
 
     def __init__(self, cfg: BoardTransformerConfig) -> None:
         super().__init__()
         assert cfg.d_model % cfg.n_head == 0, "d_model must be divisible by n_head"
         self.n_head = cfg.n_head
-        self.head_dim = cfg.d_model // cfg.n_head
+        self.n_bias_head = cfg.n_bias_head
+        self.total_heads = cfg.n_head + cfg.n_bias_head
+        self.head_dim = cfg.d_model // cfg.n_head  # content heads set head_dim
         self.d_model = cfg.d_model
-        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
-        self.out_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.inner_dim = self.total_heads * self.head_dim
+        self.qkv = nn.Linear(cfg.d_model, 3 * self.inner_dim, bias=False)
+        self.out_proj = nn.Linear(self.inner_dim, cfg.d_model, bias=False)
+
+        if self.n_bias_head > 0:
+            # Per-layer, zero-init learnable bias table for the extra heads.
+            self.rel_bias = nn.Parameter(torch.zeros(self.n_bias_head, _REL_TABLE_SIZE))
+            # Shared, non-persistent index buffer (follows device moves).
+            self.register_buffer("rel_index", _build_rel_index(cfg.seq_len), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
-        qkv = self.qkv(x)  # [B, T, 3*d]
-        q, k, v = qkv.split(self.d_model, dim=2)
-        q = q.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_head, self.head_dim).transpose(1, 2)
-        # Bidirectional: is_causal=False
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        y = y.transpose(1, 2).contiguous().view(b, t, self.d_model)
+        qkv = self.qkv(x)  # [B, T, 3*inner_dim]
+        q, k, v = qkv.split(self.inner_dim, dim=2)
+        q = q.view(b, t, self.total_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, t, self.total_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, t, self.total_heads, self.head_dim).transpose(1, 2)
+
+        if self.n_bias_head == 0:
+            # Fast path — byte-identical to the content-only model.
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        else:
+            rel_index: torch.Tensor = self.rel_index  # type: ignore[assignment]
+            bias_rows = self.rel_bias[:, rel_index]  # [n_bias_head, T, T]
+            content_rows = torch.zeros(
+                self.n_head, t, t, dtype=bias_rows.dtype, device=bias_rows.device
+            )
+            attn_bias = torch.cat([content_rows, bias_rows], dim=0)  # [total_heads, T, T]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias.unsqueeze(0), is_causal=False
+            )
+
+        y = y.transpose(1, 2).contiguous().view(b, t, self.inner_dim)
         return self.out_proj(y)
 
 

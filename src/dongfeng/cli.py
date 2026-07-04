@@ -535,6 +535,11 @@ def train_board(
     out: str = typer.Option("", "--out", help="Output dir (default: runs/<id>)."),
     checkpoint_id: str = typer.Option("board-run", "--id", help="Run/checkpoint id."),
     preset: str = typer.Option("m1-dev", "--preset", help="Model preset: m1-dev | mid | 1b."),
+    n_bias_head: int = typer.Option(
+        0,
+        "--n-bias-head",
+        help="Extra attention heads carrying a learnable 2D rel-pos bias (0 = off).",
+    ),
     max_steps: int = typer.Option(100_000, "--steps"),
     batch_size: int = typer.Option(256, "--batch"),
     lr: float = typer.Option(3e-4, "--lr"),
@@ -564,6 +569,8 @@ def train_board(
         _console.print("[red]torch is not installed.[/red]  Install with:  uv sync --extra model")
         raise typer.Exit(1) from None
 
+    from dataclasses import replace  # noqa: PLC0415
+
     from .model.board_transformer import BoardTransformer, BoardTransformerConfig  # noqa: PLC0415
     from .training.board_loop import (  # noqa: PLC0415
         BoardTrainConfig,
@@ -578,6 +585,8 @@ def train_board(
             _console.print(f"[red]Unknown preset {preset!r}. Choose from: {list(presets)}[/red]")
             raise typer.Exit(1)
         model_cfg = presets[preset]
+        if n_bias_head:
+            model_cfg = replace(model_cfg, n_bias_head=n_bias_head)
         resolved_device, dtype = resolve_device_dtype(device)
         torch.manual_seed(seed)
         model = BoardTransformer(model_cfg)
@@ -620,6 +629,12 @@ def train_board(
         f"preset={preset!r} steps={max_steps} device={resolved_device}"
     )
 
+    override = None
+    if n_bias_head:
+        _presets = BoardTransformerConfig.presets()
+        if preset in _presets:
+            override = replace(_presets[preset], n_bias_head=n_bias_head)
+
     cfg = BoardTrainConfig(
         data_dir=Path(data_dir),
         out_dir=Path(resolved_out),
@@ -635,6 +650,7 @@ def train_board(
         grad_checkpoint=grad_checkpoint,
         eval_every=eval_every,
         optim=optim,
+        config_override=override,
     )
     ckpt = bc_train_board(cfg)
 
@@ -643,6 +659,8 @@ def train_board(
     # Report num_params via a fresh model build (no weights loaded).
     presets = BoardTransformerConfig.presets()
     model_cfg = presets.get(preset)
+    if model_cfg is not None and n_bias_head:
+        model_cfg = replace(model_cfg, n_bias_head=n_bias_head)
     n_params: int | None = None
     if model_cfg is not None:
         try:
