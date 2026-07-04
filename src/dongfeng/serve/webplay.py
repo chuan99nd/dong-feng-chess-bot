@@ -432,7 +432,8 @@ def _get_system_info() -> dict[str, Any]:
             subprocess.check_output(
                 [
                     "nvidia-smi",
-                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--query-gpu=utilization.gpu,utilization.memory,memory.used,"
+                    "memory.total,temperature.gpu,power.draw",
                     "--format=csv,noheader,nounits",
                 ],
                 timeout=2,
@@ -442,11 +443,15 @@ def _get_system_info() -> dict[str, Any]:
             .strip()
         )
         parts = [p.strip() for p in out.split(",")]
-        if len(parts) >= 4:
+        if len(parts) >= 5:
             info["gpu_util"] = int(parts[0])
-            info["gpu_mem_used"] = int(parts[1])
-            info["gpu_mem_total"] = int(parts[2])
-            info["gpu_temp"] = int(parts[3])
+            info["gpu_mem_bw"] = int(parts[1])  # memory-controller BW util % (dmon "mem")
+            info["gpu_mem_used"] = int(parts[2])
+            info["gpu_mem_total"] = int(parts[3])
+            info["gpu_temp"] = int(parts[4])
+        if len(parts) >= 6:
+            with contextlib.suppress(ValueError):
+                info["gpu_power"] = round(float(parts[5]))
     except Exception:
         pass
     return info
@@ -1042,9 +1047,11 @@ async function loadSystemInfo(){
         ? `${data.gpu_mem_used} / ${data.gpu_mem_total} MiB`
         : "—";
       bar.innerHTML = [
-        ["Util",  data.gpu_util+"%"],
-        ["Mem",   mem],
-        ["Temp",  data.gpu_temp != null ? data.gpu_temp+"°C" : "—"],
+        ["SM util",  data.gpu_util+"%"],
+        ["Mem BW",   data.gpu_mem_bw != null ? data.gpu_mem_bw+"%" : "—"],
+        ["VRAM",     mem],
+        ["Power",    data.gpu_power != null ? data.gpu_power+" W" : "—"],
+        ["Temp",     data.gpu_temp != null ? data.gpu_temp+"°C" : "—"],
       ].map(([k,v])=>`<div class="gpu-chip">${k}: <span>${v}</span></div>`).join("");
     } else { card.style.display="none"; }
   } catch(e){ /* no gpu */ }
@@ -1116,6 +1123,18 @@ function renderTrainingDetail(run, metrics){
   const tps = last ? last.tokens_per_s : null;
   const gradN = last ? last.grad_norm : null;
   const elapsedH = last && last.elapsed_s ? (last.elapsed_s/3600) : null;
+  // ---- Perf metrics (derived) — compare these before/after an optimization ----
+  // Board model = fixed 91-token sequence. Training FLOPs ≈ 6·N·tokens (fwd+bwd).
+  // Set GPU_PEAK_TFLOPS to your GPU's bf16 dense peak (RTX 5090 ≈ 209) to show MFU%.
+  const SEQ_LEN = 91;
+  const GPU_PEAK_TFLOPS = 209;   // RTX 5090 bf16 (dense). Adjust for your GPU.
+  const bs = (run.config && run.config.batch_size) ? Number(run.config.batch_size) : null;
+  const nParams = run.params != null ? Number(run.params) : null;
+  const samplesPerS = tps!=null ? tps/SEQ_LEN : null;
+  const stepsPerS   = (samplesPerS!=null && bs) ? samplesPerS/bs : null;
+  const msPerStep   = stepsPerS ? 1000/stepsPerS : null;
+  const effTflops   = (tps!=null && nParams!=null) ? 6*nParams*tps/1e12 : null;
+  const mfu         = (effTflops!=null && GPU_PEAK_TFLOPS) ? effTflops/GPU_PEAK_TFLOPS*100 : null;
   const ic = (k,v,cls,sub)=>`<div class="insight ${cls||""}"><div class="k">${k}</div><div class="v">${v}</div>${sub?`<div class="sub">${sub}</div>`:""}</div>`;
   document.getElementById("training-insights").innerHTML = [
     ic("train loss", fmt(trainLoss,4)),
@@ -1127,6 +1146,12 @@ function renderTrainingDetail(run, metrics){
     ic("val trend",  trend, trendCls),
     ic("grad norm",  gradN==null?"—":fmt(gradN,3), gradN!=null&&gradN>=0.99?"warn":"", gradN!=null&&gradN>=0.99?"clipping":""),
     ic("throughput", tps==null?"—":Math.round(tps).toLocaleString()+" tok/s"),
+    ic("samples/s",  samplesPerS==null?"—":Math.round(samplesPerS).toLocaleString(), "good"),
+    ic("ms/step",    msPerStep==null?"—":msPerStep.toFixed(0)+" ms", "", bs?("batch "+bs):""),
+    ic("eff. TFLOP/s", effTflops==null?"—":effTflops.toFixed(1), "good", "6·N·tok/s"),
+    ic("MFU",        mfu==null?"—":mfu.toFixed(1)+"%",
+                     mfu==null?"":(mfu>=40?"good":(mfu<25?"warn":"")),
+                     "vs "+GPU_PEAK_TFLOPS+" TFLOP/s peak"),
     ic("lr",         last?fmt(last.lr,6):"—"),
     ic("elapsed",    elapsedH==null?"—":elapsedH.toFixed(2)+" h"),
     ic("remaining",  etaSec?((etaSec/3600).toFixed(2)+" h"):"—"),
