@@ -213,6 +213,58 @@ def _list_runs() -> list[dict[str, Any]]:
     return results
 
 
+def _list_models() -> list[dict[str, Any]]:
+    """Group runs by architecture hash — one entry per distinct model design.
+
+    Each model aggregates its runs (newest first) and surfaces the best
+    validation top-1 achieved across them, so the web UI can offer a
+    "choose a model, then a run" drill-down keyed by a stable arch hash.
+    """
+    runs = _list_runs()
+    models: dict[str, dict[str, Any]] = {}
+    for r in runs:
+        h = r.get("arch_hash") or "unknown"
+        m = models.get(h)
+        if m is None:
+            arch = r.get("arch") or {}
+            m = {
+                "arch_hash": h,
+                "preset": r.get("preset"),
+                "params": r.get("params"),
+                "arch": arch,
+                "arch_summary": (
+                    f"d{arch.get('d_model')}·L{arch.get('n_layer')}·"
+                    f"h{arch.get('n_head')}"
+                    + (f"+{arch.get('n_bias_head')}b" if arch.get("n_bias_head") else "")
+                )
+                if arch
+                else None,
+                "runs": [],
+                "best_top1": None,
+                "best_run_id": None,
+                "latest_started": r.get("started"),
+            }
+            models[h] = m
+        lv = r.get("last_val") or {}
+        top1 = lv.get("top1")
+        m["runs"].append(
+            {
+                "id": r.get("id"),
+                "status": r.get("status"),
+                "started": r.get("started"),
+                "step": (r.get("last_train") or {}).get("step"),
+                "top1": top1,
+            }
+        )
+        if top1 is not None and (m["best_top1"] is None or top1 > m["best_top1"]):
+            m["best_top1"] = top1
+            m["best_run_id"] = r.get("id")
+
+    result = list(models.values())
+    result.sort(key=lambda m: m.get("latest_started") or "", reverse=True)
+    return result
+
+
 def _downsample(rows: list[dict[str, Any]], max_pts: int = 500) -> list[dict[str, Any]]:
     """Uniformly downsample a list to at most max_pts entries."""
     n = len(rows)
@@ -259,15 +311,19 @@ def _get_system_info() -> dict[str, Any]:
     """Return GPU stats from nvidia-smi; gracefully returns empty dict if unavailable."""
     info: dict[str, Any] = {}
     try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            timeout=2,
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
+        out = (
+            subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=2,
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
         parts = [p.strip() for p in out.split(",")]
         if len(parts) >= 4:
             info["gpu_util"] = int(parts[0])
@@ -320,6 +376,8 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                     self._send_json(resp, status)
                 else:
                     self._send_json({"runs": _list_runs()})
+            elif self.path == "/api/models":
+                self._send_json({"models": _list_models()})
             elif self.path == "/api/system":
                 self._send_json(_get_system_info())
             else:
@@ -423,6 +481,18 @@ _HTML = r"""<!doctype html>
   .charts-row { display:flex; gap:16px; flex-wrap:wrap; width:100%; max-width:960px; }
   .charts-row .card { flex:1; min-width:260px; }
   #training-chart, #training-chart2 { display:block; width:100%; height:240px; background:#1a1a1a; border-radius:6px; }
+  /* Richer monitor: responsive grid of insight charts */
+  .chart-grid { display:grid; grid-template-columns:repeat(2,minmax(280px,1fr)); gap:16px; width:100%; max-width:960px; }
+  @media (max-width:720px){ .chart-grid { grid-template-columns:1fr; } }
+  .chart-grid canvas { display:block; width:100%; height:200px; background:#1a1a1a; border-radius:6px; }
+  .arch-hash { font-family: ui-monospace, monospace; font-size:11px; color:#7fd0ff; background:#12233a; border:1px solid #2a4a6a; border-radius:6px; padding:2px 8px; }
+  .insight-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; margin-top:8px; }
+  .insight { background:#1c1c1c; border:1px solid #444; border-radius:8px; padding:8px 10px; }
+  .insight .k { font-size:10px; color:#888; text-transform:uppercase; letter-spacing:.5px; }
+  .insight .v { font-size:17px; font-weight:700; color:#fff; margin-top:2px; }
+  .insight .sub { font-size:10px; color:#7a9; margin-top:2px; }
+  .insight.warn .v { color:#ffb347; }
+  .insight.good .v { color:#7fdf9f; }
 </style>
 </head>
 <body>
@@ -470,7 +540,12 @@ _HTML = r"""<!doctype html>
   <div style="width:100%;max-width:960px;">
     <h1>Training Dashboard</h1>
     <div class="card">
-      <label>Training run</label>
+      <label>Model (theo arch-hash)</label>
+      <select id="training-model-select" onchange="selectModel(this.value)">
+        <option value="">-- chọn model --</option>
+      </select>
+      <div id="training-model-meta" class="muted" style="margin-top:6px;"></div>
+      <label style="margin-top:10px;">Training run</label>
       <select id="training-run-select" onchange="selectRun(this.value)">
         <option value="">-- chọn run --</option>
       </select>
@@ -479,6 +554,7 @@ _HTML = r"""<!doctype html>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
         <strong id="training-run-id" style="font-size:15px;"></strong>
         <span id="training-status-badge" class="status-badge"></span>
+        <span id="training-arch-hash" class="arch-hash"></span>
         <span id="training-eta" style="font-size:12px;color:#aaa;margin-left:auto;"></span>
       </div>
       <div class="chips" id="training-chips"></div>
@@ -486,14 +562,15 @@ _HTML = r"""<!doctype html>
         <div class="progress-bar-fill" id="training-progress-fill" style="width:0%"></div>
       </div>
       <div class="progress-label" id="training-progress-label"></div>
+      <div class="insight-grid" id="training-insights"></div>
     </div>
     <div class="card" id="training-gpu-card" style="display:none;">
       <label style="margin-bottom:4px;">GPU</label>
       <div class="gpu-bar" id="training-gpu-bar"></div>
     </div>
-    <div class="charts-row" id="training-chart-card" style="display:none;">
+    <div class="chart-grid" id="training-chart-card" style="display:none;">
       <div class="card">
-        <label>Policy Loss</label>
+        <label>Policy Loss (log)</label>
         <canvas id="training-chart"></canvas>
         <div class="legend">
           <div class="legend-item"><div class="legend-dot" style="background:#4da6ff;"></div>Train</div>
@@ -501,10 +578,39 @@ _HTML = r"""<!doctype html>
         </div>
       </div>
       <div class="card">
-        <label>Val Top-1 Accuracy</label>
+        <label>Val Accuracy</label>
         <canvas id="training-chart2"></canvas>
         <div class="legend">
-          <div class="legend-item"><div class="legend-dot" style="background:#4caf50;"></div>Accuracy</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#4caf50;"></div>Top-1</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#c58af9;"></div>Top-5</div>
+        </div>
+      </div>
+      <div class="card">
+        <label>Learning Rate</label>
+        <canvas id="training-chart-lr"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#ffd36b;"></div>LR</div>
+        </div>
+      </div>
+      <div class="card">
+        <label>Gradient Norm</label>
+        <canvas id="training-chart-grad"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#ff6b9d;"></div>‖grad‖ (clip=1.0)</div>
+        </div>
+      </div>
+      <div class="card">
+        <label>Throughput (tokens/s)</label>
+        <canvas id="training-chart-tps"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#4dd0e1;"></div>tok/s</div>
+        </div>
+      </div>
+      <div class="card">
+        <label>Generalization gap (val − train loss)</label>
+        <canvas id="training-chart-gap"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#ffa726;"></div>gap</div>
         </div>
       </div>
     </div>
@@ -517,7 +623,7 @@ function switchTab(name){
   document.querySelectorAll(".tab-btn").forEach(el=>el.classList.remove("active"));
   document.getElementById("tab-"+name).classList.add("active");
   event.target.classList.add("active");
-  if(name==="training") loadTrainingList();
+  if(name==="training") loadModels();
 }
 
 // ---- Board play ----
@@ -639,6 +745,52 @@ refresh();
 let _trainingPollTimer = null;
 let _systemPollTimer = null;
 let _currentRunId = null;
+let _selectedArch = "";   // "" = all models
+let _modelsCache = [];
+
+async function loadModels(){
+  try {
+    const resp = await fetch("/api/models");
+    const data = await resp.json();
+    _modelsCache = data.models || [];
+    const sel = document.getElementById("training-model-select");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">-- tất cả model --</option>';
+    for(const m of _modelsCache){
+      const opt = document.createElement("option");
+      opt.value = m.arch_hash||"";
+      const p = m.params != null ? " · "+(m.params/1e6).toFixed(1)+"M" : "";
+      const best = m.best_top1 != null ? " · best top1="+Number(m.best_top1).toFixed(3) : "";
+      opt.textContent = `${m.arch_summary||m.preset||"?"} [${(m.arch_hash||"").slice(0,8)}]${p} · ${m.runs.length} run${best}`;
+      sel.appendChild(opt);
+    }
+    if(cur){ sel.value = cur; }
+    updateModelMeta();
+    loadTrainingList();
+  } catch(e){ console.error("models error",e); }
+}
+
+function selectModel(hash){
+  _selectedArch = hash || "";
+  updateModelMeta();
+  // Reset run selection when the model filter changes.
+  const rsel = document.getElementById("training-run-select");
+  rsel.value = "";
+  selectRun("");
+  loadTrainingList();
+}
+
+function updateModelMeta(){
+  const el = document.getElementById("training-model-meta");
+  if(!_selectedArch){ el.textContent = _modelsCache.length ? `${_modelsCache.length} model design(s)` : ""; return; }
+  const m = _modelsCache.find(x=>x.arch_hash===_selectedArch);
+  if(!m){ el.textContent=""; return; }
+  const a = m.arch||{};
+  el.innerHTML = `arch-hash <span class="arch-hash">${m.arch_hash}</span> · `
+    + `d_model=${a.d_model} · layers=${a.n_layer} · heads=${a.n_head}`
+    + (a.n_bias_head?` (+${a.n_bias_head} bias)`:"")
+    + ` · ffn=${a.ffn_hidden} · ${m.params!=null?(m.params/1e6).toFixed(2)+"M params":""}`;
+}
 
 async function loadTrainingList(){
   try {
@@ -647,7 +799,9 @@ async function loadTrainingList(){
     const sel = document.getElementById("training-run-select");
     const cur = sel.value;
     sel.innerHTML = '<option value="">-- chọn run --</option>';
-    for(const run of (data.runs||[])){
+    let runs = data.runs||[];
+    if(_selectedArch){ runs = runs.filter(r=>(r.arch_hash||"")===_selectedArch); }
+    for(const run of runs){
       const opt = document.createElement("option");
       opt.value = run.id||"";
       const st = run.status||"";
@@ -722,6 +876,7 @@ function renderTrainingDetail(run, metrics){
   const badge = document.getElementById("training-status-badge");
   const st = run.status||"";
   badge.textContent = st; badge.className = "status-badge status-"+st;
+  document.getElementById("training-arch-hash").textContent = run.arch_hash ? ("arch "+run.arch_hash) : "";
 
   const trainM = metrics.filter(m=>m.split==="train");
   const valM   = metrics.filter(m=>m.split==="val");
@@ -733,9 +888,9 @@ function renderTrainingDetail(run, metrics){
   const cfg = run.config || {};
   const maxSteps = cfg.max_steps ? Number(cfg.max_steps) : 0;
   const curStep  = last ? Number(last.step)+1 : 0;
-  let etaStr = "";
+  let etaStr = "", etaSec = 0;
   if(st==="running" && last && maxSteps && last.elapsed_s && last.step > 0){
-    const etaSec = Math.max(0, (maxSteps-curStep) * last.elapsed_s / curStep);
+    etaSec = Math.max(0, (maxSteps-curStep) * last.elapsed_s / curStep);
     const h = Math.floor(etaSec/3600), m = Math.floor((etaSec%3600)/60);
     etaStr = `ETA ~${h}h ${m}m`;
   }
@@ -756,29 +911,65 @@ function renderTrainingDetail(run, metrics){
   // Chips
   document.getElementById("training-chips").innerHTML = [
     ["preset",     run.preset||"—"],
-    ["params",     run.params!=null ? Number(run.params).toLocaleString() : "—"],
+    ["params",     run.params!=null ? (Number(run.params)/1e6).toFixed(2)+"M" : "—"],
     ["device",     cfg.device||"—"],
-    ["step",       last ? last.step : "—"],
-    ["lr",         last ? fmt(last.lr,6) : "—"],
-    ["policy loss",last ? fmt(last.policy_loss??last.loss) : "—"],
-    ["val loss",   lastV ? fmt(lastV.policy_loss??lastV.loss) : "—"],
-    ["val top1",   lastV ? fmt(lastV.top1,3) : "—"],
-    ["samples/s",  last ? fmt(last.samples_per_s,1) : "—"],
+    ["dtype",      run.dtype||"—"],
+    ["batch",      cfg.batch_size||"—"],
+    ["optim",      cfg.optim||"—"],
   ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
+
+  // ---- Data-scientist insight cards ----
+  const trainLoss = last ? (last.policy_loss??last.loss) : null;
+  const valLoss   = lastV ? (lastV.policy_loss??lastV.loss) : null;
+  const gap = (trainLoss!=null && valLoss!=null) ? (valLoss - trainLoss) : null;
+  const bestTop1 = valM.reduce((b,r)=> (r.top1!=null && r.top1>b ? r.top1 : b), -1);
+  // Recent val-loss slope (improving vs plateau) over the last few evals.
+  let trend = "—", trendCls="";
+  if(valM.length>=3){
+    const a=valM[valM.length-3], b=lastV;
+    const d=(b.policy_loss??b.loss)-(a.policy_loss??a.loss);
+    if(d < -1e-3){ trend="↓ improving"; trendCls="good"; }
+    else if(d > 1e-3){ trend="↑ rising"; trendCls="warn"; }
+    else { trend="→ plateau"; trendCls="warn"; }
+  }
+  const tps = last ? last.tokens_per_s : null;
+  const gradN = last ? last.grad_norm : null;
+  const elapsedH = last && last.elapsed_s ? (last.elapsed_s/3600) : null;
+  const ic = (k,v,cls,sub)=>`<div class="insight ${cls||""}"><div class="k">${k}</div><div class="v">${v}</div>${sub?`<div class="sub">${sub}</div>`:""}</div>`;
+  document.getElementById("training-insights").innerHTML = [
+    ic("train loss", fmt(trainLoss,4)),
+    ic("val loss",   fmt(valLoss,4)),
+    ic("gen. gap",   gap==null?"—":fmt(gap,4), gap!=null&&gap>0.3?"warn":(gap!=null?"good":""), "val − train"),
+    ic("val top-1",  lastV&&lastV.top1!=null?(lastV.top1*100).toFixed(2)+"%":"—", "good"),
+    ic("val top-5",  lastV&&lastV.top5!=null?(lastV.top5*100).toFixed(2)+"%":"—"),
+    ic("best top-1", bestTop1>=0?(bestTop1*100).toFixed(2)+"%":"—", "good"),
+    ic("val trend",  trend, trendCls),
+    ic("grad norm",  gradN==null?"—":fmt(gradN,3), gradN!=null&&gradN>=0.99?"warn":"", gradN!=null&&gradN>=0.99?"clipping":""),
+    ic("throughput", tps==null?"—":Math.round(tps).toLocaleString()+" tok/s"),
+    ic("lr",         last?fmt(last.lr,6):"—"),
+    ic("elapsed",    elapsedH==null?"—":elapsedH.toFixed(2)+" h"),
+    ic("remaining",  etaSec?((etaSec/3600).toFixed(2)+" h"):"—"),
+  ].join("");
 
   drawLossChart(trainM, valM);
   drawAccuracyChart(valM);
+  drawSeriesChart("training-chart-lr", trainM, r=>r.lr, "#ffd36b", v=>v.toExponential(1));
+  drawSeriesChart("training-chart-grad", trainM, r=>r.grad_norm, "#ff6b9d", v=>v.toFixed(2));
+  drawSeriesChart("training-chart-tps", trainM, r=>r.tokens_per_s, "#4dd0e1", v=>(v/1000).toFixed(0)+"k");
+  drawGapChart(trainM, valM);
 }
 
 function _chartCtx(id){
   const canvas = document.getElementById(id);
   const dpr = window.devicePixelRatio||1;
-  const W = canvas.offsetWidth||800, H = canvas.offsetHeight||240;
+  const W = canvas.offsetWidth||800, H = canvas.offsetHeight||200;
   canvas.width = W*dpr; canvas.height = H*dpr;
   const ctx = canvas.getContext("2d");
   ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
   return {ctx,W,H};
 }
+
+function _empty(ctx,W,H,msg){ ctx.fillStyle="#666"; ctx.font="13px system-ui"; ctx.textAlign="center"; ctx.fillText(msg,W/2,H/2); }
 
 function _drawGrid(ctx, PAD, W, H, xArr, yArr, yFmt){
   const cw=W-PAD.l-PAD.r, ch=H-PAD.t-PAD.b;
@@ -802,15 +993,27 @@ function _drawGrid(ctx, PAD, W, H, xArr, yArr, yFmt){
   return {xp,yp};
 }
 
+// Generic single-series line chart keyed on step.
+function drawSeriesChart(id, rows, getY, color, yFmt){
+  const {ctx,W,H} = _chartCtx(id);
+  const PAD={l:52,r:12,t:14,b:34};
+  const pts = rows.filter(r=>{const y=getY(r); return y!=null&&isFinite(y);});
+  if(!pts.length){ _empty(ctx,W,H,"No data yet."); return; }
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,pts.map(r=>r.step),pts.map(getY),yFmt);
+  ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+  pts.forEach((r,i)=>{ const x=xp(r.step),y=yp(getY(r)); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  ctx.stroke();
+}
+
 function drawLossChart(trainRows, valRows){
   const {ctx,W,H} = _chartCtx("training-chart");
   const PAD={l:52,r:12,t:14,b:34};
-  const all=[...trainRows,...valRows];
-  if(!all.length){ ctx.fillStyle="#666"; ctx.font="13px system-ui"; ctx.textAlign="center"; ctx.fillText("No metrics yet.",W/2,H/2); return; }
-  const getY=r=>r.policy_loss??r.loss;
-  const {xp,yp}=_drawGrid(ctx,PAD,W,H,all.map(r=>r.step),all.map(getY).filter(v=>v!=null&&isFinite(v)));
+  const getY=r=>{ const v=r.policy_loss??r.loss; return (v!=null&&v>0)?Math.log10(v):null; };
+  const all=[...trainRows,...valRows].filter(r=>getY(r)!=null);
+  if(!all.length){ _empty(ctx,W,H,"No metrics yet."); return; }
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,all.map(r=>r.step),all.map(getY),v=>Math.pow(10,v).toFixed(3));
   const drawLine=(rows,color)=>{
-    const pts=rows.filter(r=>getY(r)!=null&&isFinite(getY(r)));
+    const pts=rows.filter(r=>getY(r)!=null);
     if(!pts.length)return;
     ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
     pts.forEach((r,i)=>{ const x=xp(r.step),y=yp(getY(r)); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
@@ -823,16 +1026,45 @@ function drawAccuracyChart(valRows){
   const {ctx,W,H} = _chartCtx("training-chart2");
   const PAD={l:52,r:12,t:14,b:34};
   const rows=valRows.filter(r=>r.top1!=null&&isFinite(r.top1));
-  if(!rows.length){ ctx.fillStyle="#666"; ctx.font="13px system-ui"; ctx.textAlign="center"; ctx.fillText("No val metrics yet.",W/2,H/2); return; }
-  const {xp,yp}=_drawGrid(ctx,PAD,W,H,rows.map(r=>r.step),rows.map(r=>r.top1),v=>(v*100).toFixed(1)+"%");
-  ctx.strokeStyle="#4caf50"; ctx.lineWidth=2; ctx.beginPath();
-  rows.forEach((r,i)=>{ const x=xp(r.step),y=yp(r.top1); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  if(!rows.length){ _empty(ctx,W,H,"No val metrics yet."); return; }
+  const ys=[...rows.map(r=>r.top1), ...rows.filter(r=>r.top5!=null).map(r=>r.top5)];
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,rows.map(r=>r.step),ys,v=>(v*100).toFixed(1)+"%");
+  const line=(getY,color)=>{
+    const pts=rows.filter(r=>getY(r)!=null&&isFinite(getY(r)));
+    if(!pts.length)return;
+    ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
+    pts.forEach((r,i)=>{ const x=xp(r.step),y=yp(getY(r)); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+    ctx.stroke();
+  };
+  line(r=>r.top5,"#c58af9");
+  line(r=>r.top1,"#4caf50");
+  const lr=rows[rows.length-1];
+  ctx.fillStyle="#4caf50"; ctx.beginPath(); ctx.arc(xp(lr.step),yp(lr.top1),4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#afd"; ctx.font="11px system-ui"; ctx.textAlign="left";
+  ctx.fillText((lr.top1*100).toFixed(1)+"%", xp(lr.step)+8, yp(lr.top1)+4);
+}
+
+// Generalization gap = val loss − interpolated train loss at each val step.
+function drawGapChart(trainRows, valRows){
+  const {ctx,W,H} = _chartCtx("training-chart-gap");
+  const PAD={l:52,r:12,t:14,b:34};
+  const tl=trainRows.filter(r=>(r.policy_loss??r.loss)!=null);
+  const vs=valRows.filter(r=>(r.policy_loss??r.loss)!=null);
+  if(!tl.length||!vs.length){ _empty(ctx,W,H,"No data yet."); return; }
+  const trainAt=(step)=>{ // nearest train loss by step
+    let best=tl[0], bd=Math.abs(tl[0].step-step);
+    for(const r of tl){ const d=Math.abs(r.step-step); if(d<bd){bd=d;best=r;} }
+    return best.policy_loss??best.loss;
+  };
+  const pts=vs.map(r=>({step:r.step, gap:(r.policy_loss??r.loss)-trainAt(r.step)}));
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,pts.map(p=>p.step),pts.map(p=>p.gap),v=>v.toFixed(3));
+  // zero line
+  ctx.strokeStyle="#444"; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+  ctx.beginPath(); ctx.moveTo(xp(pts[0].step),yp(0)); ctx.lineTo(xp(pts[pts.length-1].step),yp(0)); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle="#ffa726"; ctx.lineWidth=2; ctx.beginPath();
+  pts.forEach((p,i)=>{ const x=xp(p.step),y=yp(p.gap); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
   ctx.stroke();
-  if(rows.length){ const lr=rows[rows.length-1];
-    ctx.fillStyle="#4caf50"; ctx.beginPath(); ctx.arc(xp(lr.step),yp(lr.top1),4,0,Math.PI*2); ctx.fill();
-    ctx.fillStyle="#afd"; ctx.font="11px system-ui"; ctx.textAlign="left";
-    ctx.fillText((lr.top1*100).toFixed(1)+"%", xp(lr.step)+8, yp(lr.top1)+4);
-  }
 }
 </script>
 </body>

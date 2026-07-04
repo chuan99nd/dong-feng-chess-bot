@@ -30,6 +30,8 @@ Architecture details (pinned by §1.1–1.2 of docs/plans/board-1b.md):
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,28 @@ class BoardTransformerConfig:
             "mid": cls(d_model=768, n_layer=20, n_head=12, ffn_hidden=2048),
             "1b": cls(d_model=1536, n_layer=36, n_head=12, ffn_hidden=4096),
         }
+
+    def arch_hash(self) -> str:
+        """Stable short hash identifying this *architecture*.
+
+        Derived only from the fields that change the parameter shapes / graph
+        (not ``gradient_checkpointing``, which is a runtime-only toggle). Two
+        checkpoints with the same ``arch_hash`` are weight-compatible; any change
+        to the architecture yields a new hash. Used to group training runs by
+        model design in the manifest and web monitor.
+        """
+        arch = {
+            "d_model": self.d_model,
+            "n_layer": self.n_layer,
+            "n_head": self.n_head,
+            "n_bias_head": self.n_bias_head,
+            "ffn_hidden": self.ffn_hidden,
+            "vocab_size": self.vocab_size,
+            "seq_len": self.seq_len,
+            "n_moves": self.n_moves,
+        }
+        payload = json.dumps(arch, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
 # ---------------------------------------------------------------------------

@@ -678,10 +678,12 @@ def train_board(
     if model_cfg is not None and n_bias_head:
         model_cfg = replace(model_cfg, n_bias_head=n_bias_head)
     n_params: int | None = None
+    arch_hash: str | None = None
     if model_cfg is not None:
         try:
             _model = BoardTransformer(model_cfg)
             n_params = _model.num_params()
+            arch_hash = model_cfg.arch_hash()
         except Exception:  # noqa: BLE001
             pass
 
@@ -691,6 +693,7 @@ def train_board(
         "path": str(ckpt),
         "kind": "bc-board",
         "preset": preset,
+        "arch_hash": arch_hash,
         "params": n_params,
         "step": max_steps,
         "run_id": checkpoint_id,

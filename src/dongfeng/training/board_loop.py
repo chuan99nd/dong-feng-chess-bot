@@ -323,10 +323,22 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
     # ------------------------------------------------------------------ run.json
     started_iso = datetime.now(UTC).isoformat()
+    arch_cfg = model.config
     run_meta: dict[str, Any] = {
         "id": config.id,
         "kind": "bc-board",
         "preset": config.preset,
+        "arch_hash": arch_cfg.arch_hash(),
+        "arch": {
+            "d_model": arch_cfg.d_model,
+            "n_layer": arch_cfg.n_layer,
+            "n_head": arch_cfg.n_head,
+            "n_bias_head": arch_cfg.n_bias_head,
+            "ffn_hidden": arch_cfg.ffn_hidden,
+            "seq_len": arch_cfg.seq_len,
+            "vocab_size": arch_cfg.vocab_size,
+            "n_moves": arch_cfg.n_moves,
+        },
         "params": model.num_params(),
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
@@ -377,12 +389,13 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
     # ------------------------------------------------------------------ eval helper
     @torch.no_grad()
-    def _run_val() -> tuple[float, float, float]:
-        """Return (val_loss, val_policy_loss, val_top1) over the whole val set."""
+    def _run_val() -> tuple[float, float, float, float]:
+        """Return (val_loss, val_policy_loss, val_top1, val_top5) over the val set."""
         model.eval()
         total_loss_acc = 0.0
         total_policy_acc = 0.0
         total_correct = 0
+        total_correct5 = 0
         total_n = 0
         n_batches = max(1, math.ceil(len(val_boards) / config.batch_size))
         for bi in range(n_batches):
@@ -401,11 +414,18 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             total_policy_acc += p_loss.item() * batch_n
             preds = p_logits.argmax(dim=-1)
             total_correct += (preds == vm).sum().item()
+            top5 = p_logits.topk(min(5, p_logits.shape[-1]), dim=-1).indices
+            total_correct5 += (top5 == vm.unsqueeze(-1)).any(dim=-1).sum().item()
             total_n += batch_n
 
         model.train()
         n = max(total_n, 1)
-        return total_loss_acc / n, total_policy_acc / n, total_correct / n
+        return (
+            total_loss_acc / n,
+            total_policy_acc / n,
+            total_correct / n,
+            total_correct5 / n,
+        )
 
     # ------------------------------------------------------------------ train loop
     best_val_policy = resume_best_val
@@ -443,12 +463,13 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
             opt.zero_grad(set_to_none=True)
             total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
             elapsed = time.time() - t_start
             dt = time.time() - t0
             sps = bs / max(dt, 1e-9)
+            tps = sps * model.config.seq_len
 
             train_loss = total.item()
             if step_0_loss is None:
@@ -465,7 +486,9 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                         "value_loss": v_loss.item() if v_loss is not None else None,
                         "top1": None,
                         "lr": lr,
+                        "grad_norm": float(grad_norm),
                         "samples_per_s": sps,
+                        "tokens_per_s": tps,
                         "elapsed_s": elapsed,
                     }
                 )
@@ -473,7 +496,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             # Validate + maybe save.
             do_eval = (step + 1) % config.eval_every == 0 or step == config.max_steps - 1
             if do_eval:
-                val_loss, val_policy_loss, val_top1 = _run_val()
+                val_loss, val_policy_loss, val_top1, val_top5 = _run_val()
                 val_elapsed = time.time() - t_start
                 _log_metrics(
                     {
@@ -483,8 +506,11 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                         "policy_loss": val_policy_loss,
                         "value_loss": None,
                         "top1": val_top1,
+                        "top5": val_top5,
                         "lr": lr,
+                        "grad_norm": float(grad_norm),
                         "samples_per_s": sps,
+                        "tokens_per_s": tps,
                         "elapsed_s": val_elapsed,
                     }
                 )
@@ -497,7 +523,9 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                             "val_policy_loss": val_policy_loss,
                             "val_loss": val_loss,
                             "val_top1": val_top1,
+                            "val_top5": val_top5,
                             "preset": config.preset,
+                            "arch_hash": model.config.arch_hash(),
                         },
                     )
 
