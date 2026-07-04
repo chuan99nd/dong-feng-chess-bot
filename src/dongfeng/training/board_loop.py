@@ -143,6 +143,25 @@ class BoardTrainConfig:
 # ---------------------------------------------------------------------------
 
 
+def _git_info() -> dict[str, str | None]:
+    """Best-effort git branch + short commit of the training code (for provenance)."""
+    import subprocess  # noqa: PLC0415
+
+    def _run(args: list[str]) -> str | None:
+        try:
+            out = subprocess.check_output(
+                ["git", *args], stderr=subprocess.DEVNULL, timeout=3
+            )
+            return out.decode().strip() or None
+        except Exception:
+            return None
+
+    return {
+        "git_commit": _run(["rev-parse", "--short", "HEAD"]),
+        "git_branch": _run(["rev-parse", "--abbrev-ref", "HEAD"]),
+    }
+
+
 def _lr_at(step: int, warmup: int, max_steps: int, peak_lr: float) -> float:
     """Linear warmup → cosine decay to 10 % of peak."""
     if step < warmup:
@@ -489,6 +508,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "compiled": compiled,
+        **_git_info(),
         "data_on_device": data_on_device,
         "data_dir": str(config.data_dir),
         "started": started_iso,

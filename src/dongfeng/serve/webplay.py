@@ -1170,6 +1170,8 @@ function renderTrainingDetail(run, metrics){
     ["dtype",      run.dtype||"—"],
     ["batch",      cfg.batch_size||"—"],
     ["optim",      cfg.optim||"—"],
+    ["compiled",   run.compiled===true ? "yes" : (run.compiled===false ? "no" : "—")],
+    ["code",       run.git_commit ? ((run.git_branch||"?")+"@"+run.git_commit) : "—"],
   ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
 
   // ---- Data-scientist insight cards ----
