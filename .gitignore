@@ -1,3 +1,8 @@
+# Secrets — token for deploy/commit-model.yml push (NEVER commit)
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]

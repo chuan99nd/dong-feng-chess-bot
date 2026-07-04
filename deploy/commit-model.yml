@@ -28,6 +28,9 @@
     # Name of the model directory in git; defaults to the run id.
     model_name: "{{ run_id | default('') }}"
     dest_dir: "{{ repo_root }}/models/{{ model_name }}"
+    # Push over HTTPS with a token fetched from macOS (gh CLI / keychain),
+    # not the SSH remote — so auth doesn't depend on an ssh-agent.
+    github_https: "https://github.com/chuan99nd/dong-feng-chess-bot.git"
 
   tasks:
     - name: Require run_id
@@ -96,13 +99,56 @@
         - commit_res.rc != 0
         - "'nothing to commit' not in commit_res.stdout"
 
-    - name: Push to GitHub (origin, current branch)
+    # --- Secure push to main: token read from .env (gitignored), never in argv ---
+    - name: Require .env with a GitHub PAT (model save is critical — fail loud)
       delegate_to: localhost
-      command:
-        cmd: git push origin HEAD
-        chdir: "{{ repo_root }}"
+      vars:
+        env_pat: "{{ (lookup('ansible.builtin.file', repo_root ~ '/.env', errors='ignore') | default('')) | regex_search('(?m)^\\s*GITHUB_PAT\\s*=\\s*(\\S+)', '\\1') }}"
+      assert:
+        that:
+          - env_pat | length > 0
+          - env_pat[0] | length > 20
+        fail_msg: >-
+          No GITHUB_PAT in {{ repo_root }}/.env (copy .env.example → .env and fill
+          it in). The model is committed locally at models/{{ model_name }} but was
+          NOT pushed to GitHub.
+      no_log: true
 
-    - name: Report
+    - name: Push HEAD -> main (git-lfs) — token sourced from .env into the shell env
+      delegate_to: localhost
+      # A pure shell so `. .env` loads GITHUB_PAT into the environment; git's
+      # credential helper reads $GITHUB_PAT from env, so the token is never in
+      # argv, in a registered fact, or in the remote URL.
+      shell: |
+        set -a
+        . "{{ repo_root }}/.env"
+        set +a
+        git -c credential.helper= \
+            -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GITHUB_PAT"; }; f' \
+            push "{{ github_https }}" HEAD:main
+      args:
+        chdir: "{{ repo_root }}"
+      register: push_res
+      changed_when: push_res.rc == 0
+      failed_when: false
+      no_log: true  # keeps the token env out of logs; next task surfaces errors
+
+    - name: Abort loudly if the push failed (model NOT on GitHub)
+      delegate_to: localhost
+      when: push_res.rc != 0
+      fail:
+        msg: |
+          PUSH TO main FAILED — the model is committed locally at
+          models/{{ model_name }} but is NOT on GitHub. Fix and retry.
+          git exit code: {{ push_res.rc }}
+          --- stderr ---
+          {{ push_res.stderr | default('(none)') }}
+          --- stdout ---
+          {{ push_res.stdout | default('(none)') }}
+
+    - name: Report success
       delegate_to: localhost
       debug:
-        msg: "Committed models/{{ model_name }}/ckpt.pt (run {{ run_id }}) to GitHub via LFS."
+        msg: >-
+          Pushed models/{{ model_name }}/ckpt.pt (run {{ run_id }}) to GitHub
+          main via Git LFS, authenticated with the PAT from .env.
