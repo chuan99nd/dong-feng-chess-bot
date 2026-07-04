@@ -1,0 +1,108 @@
+---
+# deploy/commit-model.yml — Version a trained checkpoint into GitHub (Git LFS).
+#
+# Pulls runs/<run_id>/ckpt.pt (+ run.json) from the GPU server down to this Mac,
+# tracks *.pt under models/ with Git LFS, then commits + pushes it as
+# models/<model_name>/ckpt.pt. This makes the trained model a versioned GitHub
+# artifact — matching the code-via-GitHub deploy flow (the server pulls code, and
+# now can pull the model too) instead of an out-of-band rsync mirror.
+#
+# Checkpoints are ~90 MB (and 1B models are far larger), so they go through
+# Git LFS, never plain git history.
+#
+# Usage:
+#   cd deploy && ansible-playbook commit-model.yml -e run_id=wp-aug-bias-300
+#   cd deploy && ansible-playbook commit-model.yml -e run_id=wp-aug-bias-300 -e model_name=prod
+#
+# Requirements: git-lfs on this Mac (`brew install git-lfs`) and push access to
+# origin. No sudo needed — all git work happens locally on the Mac.
+
+- name: Dong Feng — Commit a trained model to GitHub (Git LFS)
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    repo_root: "{{ playbook_dir | dirname }}"
+    # Name of the model directory in git; defaults to the run id.
+    model_name: "{{ run_id | default('') }}"
+    dest_dir: "{{ repo_root }}/models/{{ model_name }}"
+
+  tasks:
+    - name: Require run_id
+      delegate_to: localhost
+      assert:
+        that:
+          - run_id is defined
+          - run_id | length > 0
+        fail_msg: "Pass -e run_id=<run> (a runs/<run>/ckpt.pt that exists on the server)."
+
+    - name: Ensure the model dir exists locally
+      delegate_to: localhost
+      file:
+        path: "{{ dest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Pull runs/<run_id>/ckpt.pt + run.json from server → Mac
+      synchronize:
+        mode: pull
+        src: "{{ app_dir }}/runs/{{ run_id }}/"
+        dest: "{{ dest_dir }}/"
+        rsync_opts:
+          - "--include=ckpt.pt"
+          - "--include=run.json"
+          - "--exclude=*"
+
+    - name: Fail early if no checkpoint was pulled
+      delegate_to: localhost
+      stat:
+        path: "{{ dest_dir }}/ckpt.pt"
+      register: ckpt_stat
+
+    - name: Assert the checkpoint is present
+      delegate_to: localhost
+      assert:
+        that: ckpt_stat.stat.exists
+        fail_msg: "No ckpt.pt found for run_id={{ run_id }} on the server."
+
+    - name: Ensure Git LFS is initialised for this repo
+      delegate_to: localhost
+      command:
+        cmd: git lfs install --local
+        chdir: "{{ repo_root }}"
+
+    - name: Track models/**/*.pt with Git LFS
+      delegate_to: localhost
+      command:
+        cmd: git lfs track "models/**/*.pt"
+        chdir: "{{ repo_root }}"
+
+    - name: Stage the model + LFS attributes
+      delegate_to: localhost
+      command:
+        cmd: git add .gitattributes "models/{{ model_name }}"
+        chdir: "{{ repo_root }}"
+
+    - name: Commit the model (no-op if unchanged)
+      delegate_to: localhost
+      command:
+        cmd: 'git commit -m "model: add {{ model_name }} checkpoint (run {{ run_id }})"'
+        chdir: "{{ repo_root }}"
+      register: commit_res
+      changed_when: commit_res.rc == 0
+      failed_when:
+        - commit_res.rc != 0
+        - "'nothing to commit' not in commit_res.stdout"
+
+    - name: Push to GitHub (origin, current branch)
+      delegate_to: localhost
+      command:
+        cmd: git push origin HEAD
+        chdir: "{{ repo_root }}"
+
+    - name: Report
+      delegate_to: localhost
+      debug:
+        msg: "Committed models/{{ model_name }}/ckpt.pt (run {{ run_id }}) to GitHub via LFS."
