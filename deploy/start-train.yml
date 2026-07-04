@@ -28,6 +28,12 @@
     # starting from scratch. Leave empty to always train fresh.
     hf_repo: chuannd1999/dong-feng-chess-bot
     hf_model: ""
+    # Optional PyTorch profiler: writes runs/<id>/profile.json (per-op FLOPS +
+    # MFU) once at step train_profile_at. NOTE: on a resumed run, set
+    # train_profile_at to a step ABOVE the resume step (else it never fires).
+    train_profile: false
+    train_profile_at: 50
+    train_profile_steps: 8
 
   tasks:
     - name: Check for a local checkpoint mirror on the Mac
@@ -89,7 +95,7 @@
           User={{ app_user }}
           WorkingDirectory={{ app_dir }}
           Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
-          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id {{ run_id }}
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id {{ run_id }}{{ (' --profile --profile-at ' ~ train_profile_at ~ ' --profile-steps ' ~ train_profile_steps) if train_profile else '' }}
           Restart=no
           StandardOutput=append:{{ app_dir }}/runs/train.log
           StandardError=append:{{ app_dir }}/runs/train.log
