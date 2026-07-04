@@ -1,0 +1,92 @@
+---
+# deploy/install-pikafish.yml — Build & install the Pikafish engine on the server.
+#
+# Pikafish is the strong external UCI Xiangqi engine used as an opponent (web UI
+# "pikafish") and a distillation teacher. This builds it from source (most
+# reliable — the matching NNUE net is fetched by `make net`) and installs it
+# into ~/.local/bin, which is already on the dongfeng-web service PATH, so the
+# web engine finds `pikafish` with no restart and no sudo.
+#
+# Usage:
+#   cd deploy && ansible-playbook install-pikafish.yml
+#   cd deploy && ansible-playbook install-pikafish.yml -e pikafish_arch=x86-64-bmi2
+#
+# The NNUE is placed at {{ app_dir }}/pikafish.nnue (the web service cwd) so
+# Pikafish loads its default EvalFile. No sudo needed (all under $HOME).
+
+- name: Dong Feng — Install Pikafish (build from source)
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    src_dir: /home/{{ app_user }}/.pikafish-src
+    bin_dst: /home/{{ app_user }}/.local/bin/pikafish
+    # CPU microarch for the build. avx2 is safe on modern Intel/AMD; override
+    # with -e pikafish_arch=x86-64-bmi2 (or vnni512/avx512) for a faster build.
+    pikafish_arch: x86-64-avx2
+    pikafish_repo: https://github.com/official-pikafish/Pikafish.git
+
+  tasks:
+    - name: Ensure a C++ toolchain is present (from setup.yml's build-essential)
+      shell: command -v g++ && command -v make
+      changed_when: false
+
+    - name: Clone / update Pikafish source
+      git:
+        repo: "{{ pikafish_repo }}"
+        dest: "{{ src_dir }}"
+        version: master
+        depth: 1
+        force: true
+
+    - name: Download the NNUE net (make net)
+      shell: |
+        set -e
+        cd {{ src_dir }}/src
+        make net
+      register: net_dl
+      changed_when: "'downloading' in (net_dl.stdout | lower) or 'default net' in (net_dl.stdout | lower)"
+
+    - name: Build Pikafish ({{ pikafish_arch }})
+      shell: |
+        set -e
+        cd {{ src_dir }}/src
+        make -j"$(nproc)" build ARCH={{ pikafish_arch }}
+      register: build
+      changed_when: true
+
+    - name: Install the binary onto PATH (~/.local/bin/pikafish)
+      copy:
+        src: "{{ src_dir }}/src/pikafish"
+        dest: "{{ bin_dst }}"
+        mode: "0755"
+        remote_src: true
+
+    - name: Place the NNUE next to the binary AND in the web service cwd
+      shell: |
+        set -e
+        cd {{ src_dir }}/src
+        nnue="$(ls *.nnue | head -1)"
+        cp "$nnue" "{{ app_dir }}/pikafish.nnue"
+        cp "$nnue" "/home/{{ app_user }}/.local/bin/pikafish.nnue"
+        echo "$nnue"
+      register: nnue_cp
+      changed_when: true
+
+    - name: Verify Pikafish starts + loads the net (uci handshake)
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        printf 'uci\nquit\n' | pikafish 2>&1 | grep -E 'id name|Pikafish|uciok' | head -5
+      register: uci
+      changed_when: false
+      failed_when: "'uciok' not in uci.stdout"
+
+    - name: Report
+      debug:
+        msg: >-
+          Pikafish installed at {{ bin_dst }} (net: {{ nnue_cp.stdout | trim }}).
+          uci check: {{ uci.stdout_lines }}. The web 'pikafish' engine now works
+          (no restart needed — resolved on PATH on next engine build).
