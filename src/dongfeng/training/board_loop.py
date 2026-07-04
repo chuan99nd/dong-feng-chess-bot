@@ -149,9 +149,7 @@ def _git_info() -> dict[str, str | None]:
 
     def _run(args: list[str]) -> str | None:
         try:
-            out = subprocess.check_output(
-                ["git", *args], stderr=subprocess.DEVNULL, timeout=3
-            )
+            out = subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, timeout=3)
             return out.decode().strip() or None
         except Exception:
             return None
@@ -551,14 +549,24 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
     # ------------------------------------------------------------------ eval helper
     @torch.no_grad()
-    def _run_val() -> tuple[float, float, float, float]:
-        """Return (val_loss, val_policy_loss, val_top1, val_top5) over the val set."""
+    def _run_val() -> dict[str, float]:
+        """Validate over the val set; return policy + VALUE-quality metrics.
+
+        Value quality is measured only over non-masked (``!= 127``) samples:
+        ``val_value_mse`` = MSE of tanh(value) vs the −1/0/+1 outcome, and
+        ``val_value_corr`` = Pearson corr of the two. These are the gate for
+        whether MCTS ``value_mode='head'`` can beat ``'rollout'``.
+        """
         model.eval()
         total_loss_acc = 0.0
         total_policy_acc = 0.0
         total_correct = 0
         total_correct5 = 0
         total_n = 0
+        # value-quality running sums over non-masked samples (for MSE + Pearson)
+        vn = 0
+        vse = 0.0
+        sx = sy = sxx = syy = sxy = 0.0
         n_batches = max(1, math.ceil(len(val_boards) / config.batch_size))
         for bi in range(n_batches):
             s = bi * config.batch_size
@@ -580,14 +588,34 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             total_correct5 += (top5 == vm.unsqueeze(-1)).any(dim=-1).sum().item()
             total_n += batch_n
 
+            vmask = vv != _MASK_VALUE
+            if bool(vmask.any()):
+                vp = v_pred.float()[vmask]
+                vt = vv.float()[vmask]
+                vn += int(vp.numel())
+                vse += float(((vp - vt) ** 2).sum().item())
+                sx += float(vp.sum().item())
+                sy += float(vt.sum().item())
+                sxx += float((vp * vp).sum().item())
+                syy += float((vt * vt).sum().item())
+                sxy += float((vp * vt).sum().item())
+
         model.train()
         n = max(total_n, 1)
-        return (
-            total_loss_acc / n,
-            total_policy_acc / n,
-            total_correct / n,
-            total_correct5 / n,
-        )
+        val_value_mse = (vse / vn) if vn else float("nan")
+        val_value_corr = float("nan")
+        if vn > 1:
+            denom = (vn * sxx - sx * sx) * (vn * syy - sy * sy)
+            if denom > 0:
+                val_value_corr = (vn * sxy - sx * sy) / (denom**0.5)
+        return {
+            "val_loss": total_loss_acc / n,
+            "val_policy_loss": total_policy_acc / n,
+            "val_top1": total_correct / n,
+            "val_top5": total_correct5 / n,
+            "val_value_mse": val_value_mse,
+            "val_value_corr": val_value_corr,
+        }
 
     # ------------------------------------------------------------------ train loop
     best_val_policy = resume_best_val
@@ -619,9 +647,13 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             with _forward_ctx():
                 p_logits, v_pred = train_model(b_batch)
 
-            total, p_loss, v_loss = _compute_loss(
-                p_logits, v_pred, m_batch, v_batch, config.value_weight
+            # Ramp the value weight 0 → config.value_weight over the first ~10% of
+            # steps so the noisy early value head doesn't disturb policy learning.
+            # (On resume, step is already high → full weight immediately.)
+            vw_ramp = config.value_weight * min(
+                1.0, (step + 1) / max(1, int(0.1 * config.max_steps))
             )
+            total, p_loss, v_loss = _compute_loss(p_logits, v_pred, m_batch, v_batch, vw_ramp)
 
             opt.zero_grad(set_to_none=True)
             total.backward()
@@ -673,17 +705,20 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
             # Validate + maybe save.
             if do_eval:
-                val_loss, val_policy_loss, val_top1, val_top5 = _run_val()
+                vres = _run_val()
+                val_policy_loss = vres["val_policy_loss"]
                 val_elapsed = time.time() - t_start
                 _log_metrics(
                     {
                         "step": step,
                         "split": "val",
-                        "loss": val_loss,
+                        "loss": vres["val_loss"],
                         "policy_loss": val_policy_loss,
-                        "value_loss": None,
-                        "top1": val_top1,
-                        "top5": val_top5,
+                        # value_loss now measured: MSE of tanh(value) vs outcome.
+                        "value_loss": vres["val_value_mse"] if corpus_has_values else None,
+                        "value_corr": vres["val_value_corr"] if corpus_has_values else None,
+                        "top1": vres["val_top1"],
+                        "top5": vres["val_top5"],
                         "lr": lr,
                         "grad_norm": float(grad_norm),
                         "samples_per_s": sps,
@@ -698,9 +733,11 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                         extra={
                             "step": step,
                             "val_policy_loss": val_policy_loss,
-                            "val_loss": val_loss,
-                            "val_top1": val_top1,
-                            "val_top5": val_top5,
+                            "val_loss": vres["val_loss"],
+                            "val_top1": vres["val_top1"],
+                            "val_top5": vres["val_top5"],
+                            "val_value_mse": vres["val_value_mse"],
+                            "val_value_corr": vres["val_value_corr"],
                             "preset": config.preset,
                             "arch_hash": model.config.arch_hash(),
                         },
