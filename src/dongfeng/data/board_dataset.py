@@ -19,7 +19,7 @@ A ``board_meta.json`` file holds the schema tag and counts (§1.3).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +53,150 @@ def _value_target(result: GameResult, turn: Color) -> int:
     return _RESULT_TURN_TO_VALUE.get((result, turn), _MASK_VALUE)
 
 
+# ---------------------------------------------------------------------------
+# Data augmentation (WP-AUG) — precomputed permutation / LUT tables.
+#
+# Two label-preserving symmetries multiply the corpus cheaply (value is
+# mover-relative, so it is invariant under both):
+#   * Mirror (left-right): a true Xiangqi symmetry, ``(f, r) -> (8-f, r)``.
+#   * Rotate-180 + colour swap: the equivalent position seen by the other side,
+#     ``(f, r) -> (8-f, 9-r)`` plus swapping piece colours and flipping the
+#     side-to-move token.
+#
+# Board seq layout (``board-v1``, length 91): index ``i`` in ``0..89`` maps to
+# ``file = i % 9``, ``iccs_rank = 9 - i // 9`` (FEN stores rank 9 first);
+# index ``90`` is the side-to-move token.
+# ---------------------------------------------------------------------------
+
+_SEQ_LEN: int = 91
+_MOVE_VOCAB: int = MoveTokenizer().vocab_size  # 2554
+_MOVE_NUM_SPECIAL: int = MoveTokenizer._NUM_SPECIAL  # 4
+
+# Board colour-swap LUT over the 21-token board vocabulary: red pieces (5..11)
+# <-> black pieces (12..18, = red + 7); side tokens 19 <-> 20; everything else
+# (specials, empty) maps to itself.
+COLOR_SWAP: np.ndarray = np.arange(21, dtype=np.uint8)
+for _red in range(5, 12):  # K A B N R C P
+    COLOR_SWAP[_red] = _red + 7
+    COLOR_SWAP[_red + 7] = _red
+COLOR_SWAP[19], COLOR_SWAP[20] = 20, 19
+
+
+def _pos_mirror() -> np.ndarray:
+    """Gather index for the left-right mirror on the 91-token board sequence."""
+    perm = np.arange(_SEQ_LEN, dtype=np.int64)
+    for i in range(90):
+        perm[i] = (i // 9) * 9 + (8 - i % 9)
+    perm[90] = 90
+    return perm
+
+
+def _pos_rot180() -> np.ndarray:
+    """Gather index for the 180-degree rotation on the 91-token board sequence."""
+    perm = np.arange(_SEQ_LEN, dtype=np.int64)
+    for i in range(90):
+        perm[i] = 89 - i
+    perm[90] = 90
+    return perm
+
+
+#: ``board[POS_MIRROR]`` yields the left-right mirrored board (token values
+#: unchanged). Applied as a gather.
+POS_MIRROR: np.ndarray = _pos_mirror()
+
+#: ``board[POS_ROT180]`` yields the 180-rotated board; colours must then be
+#: swapped via :data:`COLOR_SWAP` to produce the equivalent-for-the-other-side
+#: position.
+POS_ROT180: np.ndarray = _pos_rot180()
+
+# ICCS square notation used by ``move-v1``.
+_FILES = "abcdefghi"
+_RANKS = "0123456789"
+
+
+def _iccs_to_fr(sq: str) -> tuple[int, int]:
+    return _FILES.index(sq[0]), _RANKS.index(sq[1])
+
+
+def _fr_to_iccs(f: int, r: int) -> str:
+    return f"{_FILES[f]}{_RANKS[r]}"
+
+
+def _build_move_perm(transform: Callable[[int, int], tuple[int, int]]) -> np.ndarray:
+    """Build a move-id permutation table for a coordinate ``transform``.
+
+    ``transform(f, r) -> (f', r')`` is applied to both the from- and to-square
+    of every non-special move id. Special ids (0..3) map to themselves. Every
+    transformed move must re-encode to a valid id (the transforms are board
+    symmetries, so this is guaranteed); we assert it to catch table drift.
+    """
+    move_tok = MoveTokenizer()
+    perm = np.arange(_MOVE_VOCAB, dtype=np.uint16)
+    for m in range(_MOVE_NUM_SPECIAL, _MOVE_VOCAB):
+        iccs = move_tok._moves[m - _MOVE_NUM_SPECIAL]
+        f0, r0 = _iccs_to_fr(iccs[:2])
+        f1, r1 = _iccs_to_fr(iccs[2:])
+        nf0, nr0 = transform(f0, r0)
+        nf1, nr1 = transform(f1, r1)
+        new_iccs = _fr_to_iccs(nf0, nr0) + _fr_to_iccs(nf1, nr1)
+        new_id = move_tok._move_to_id.get(new_iccs)
+        assert new_id is not None, f"transformed move {new_iccs!r} not in move vocab"
+        perm[m] = new_id
+    return perm
+
+
+#: ``MOVE_MIRROR[m]`` is the id of move ``m`` reflected left-right.
+MOVE_MIRROR: np.ndarray = _build_move_perm(lambda f, r: (8 - f, r))
+
+#: ``MOVE_ROT180[m]`` is the id of move ``m`` rotated 180 degrees.
+MOVE_ROT180: np.ndarray = _build_move_perm(lambda f, r: (8 - f, 9 - r))
+
+
+def _augment_game(
+    boards: list[list[int]],
+    moves: list[int],
+    values: list[int],
+    *,
+    mirror: bool,
+    color_augment: bool,
+) -> tuple[list[list[int]], list[int], list[int]]:
+    """Expand one game's per-ply samples with the enabled symmetries.
+
+    Emits, per input ply, the original plus (in order): the mirror, the
+    colour-swapped rotate-180 variant, and the mirror-of-colour-swap variant,
+    depending on the ``mirror`` / ``color_augment`` flags. The ``value`` target
+    is invariant under both symmetries and is repeated verbatim.
+    """
+    if not mirror and not color_augment:
+        return list(boards), list(moves), list(values)
+
+    b = np.asarray(boards, dtype=np.uint8)  # (n, 91)
+    m = np.asarray(moves, dtype=np.uint16)  # (n,)
+
+    out_boards: list[np.ndarray] = [b]
+    out_moves: list[np.ndarray] = [m]
+
+    if mirror:
+        out_boards.append(b[:, POS_MIRROR])
+        out_moves.append(MOVE_MIRROR[m])
+    if color_augment:
+        # Colour-swapped rotate-180 variant (the equivalent position for the
+        # other side).
+        color_b = COLOR_SWAP[b[:, POS_ROT180]]
+        color_m = MOVE_ROT180[m]
+        out_boards.append(color_b)
+        out_moves.append(color_m)
+        if mirror:
+            # ...and its left-right mirror (x4 total).
+            out_boards.append(color_b[:, POS_MIRROR])
+            out_moves.append(MOVE_MIRROR[color_m])
+
+    new_boards = np.concatenate(out_boards, axis=0).tolist()
+    new_moves = np.concatenate(out_moves, axis=0).tolist()
+    new_values = list(values) * len(out_boards)
+    return new_boards, new_moves, new_values
+
+
 @dataclass
 class BoardBuildStats:
     """Summary returned (and written) by :func:`build_board_shards`."""
@@ -62,6 +206,7 @@ class BoardBuildStats:
     skipped_games: int = 0
     shards: list[str] = field(default_factory=list)
     out_dir: str = ""
+    augment_factor: int = 1
 
 
 def build_board_shards(
@@ -70,6 +215,8 @@ def build_board_shards(
     *,
     shard_size: int = 1_000_000,
     created: str | None = None,
+    mirror: bool = True,
+    color_augment: bool = True,
 ) -> BoardBuildStats:
     """Encode games into per-ply board-state binary shards on disk.
 
@@ -79,9 +226,19 @@ def build_board_shards(
             ``values_XXXXX.bin``, and ``board_meta.json`` into.
         shard_size: Maximum number of samples per shard file.
         created: Optional ISO-8601 timestamp recorded in the metadata.
+        mirror: If ``True`` (default), also emit the left-right mirror of every
+            sample (a true Xiangqi symmetry). Value is unchanged.
+        color_augment: If ``True`` (default), also emit the rotate-180 +
+            colour-swap variant (the equivalent position for the other side).
+            Value is unchanged (it is mover-relative).
 
     Returns:
         A :class:`BoardBuildStats` with the counts and shard basenames.
+        :attr:`~BoardBuildStats.num_samples` is the **post-augmentation** count.
+
+    Augmentation is applied *inside* the per-game loop, before a game's plies are
+    committed to the shared buffers, so a position and its augmented variants can
+    never be split across a downstream train/val boundary.
 
     Games (or individual plies) that fail to tokenize are silently skipped and
     counted in :attr:`BoardBuildStats.skipped_games`.
@@ -89,10 +246,17 @@ def build_board_shards(
     board_tok = BoardTokenizer()
     move_tok = MoveTokenizer()
 
+    # Augmentation factor: original (x1) x mirror (x2 if on) x color (x2 if on).
+    factor = 1
+    if mirror:
+        factor *= 2
+    if color_augment:
+        factor *= 2
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    stats = BoardBuildStats(out_dir=str(out))
+    stats = BoardBuildStats(out_dir=str(out), augment_factor=factor)
 
     # In-memory buffers for the current shard (pre-allocated in chunks).
     _boards_buf: list[list[int]] = []
@@ -164,12 +328,18 @@ def build_board_shards(
             stats.skipped_games += 1
             continue
 
+        # Augment this game's plies (mirror / colour) before committing, so a
+        # position and its variants stay together for the downstream split.
+        aug_boards, aug_moves, aug_values = _augment_game(
+            game_boards, game_moves, game_values, mirror=mirror, color_augment=color_augment
+        )
+
         # Commit this game's plies into the shared buffers.
-        boards_buf.extend(game_boards)
-        moves_buf.extend(game_moves)
-        values_buf.extend(game_values)
+        boards_buf.extend(aug_boards)
+        moves_buf.extend(aug_moves)
+        values_buf.extend(aug_values)
         stats.num_games += 1
-        stats.num_samples += len(game_boards)
+        stats.num_samples += len(aug_boards)
 
         # Flush when the buffer is full.
         if len(boards_buf) >= shard_size:
@@ -187,6 +357,7 @@ def build_board_shards(
         "move_tokenizer": MoveTokenizer.id,
         "shards": stats.shards,
         "created": created,
+        "augment": {"mirror": mirror, "color": color_augment, "factor": factor},
     }
     with open(out / "board_meta.json", "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)

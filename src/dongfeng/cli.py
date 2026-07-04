@@ -332,10 +332,25 @@ def data_ingest_board(
     out: str = typer.Option(..., "--out", help="Output dir for board shards (under data/)."),
     dataset_id: str = typer.Option(..., "--id", help="Unique dataset id for the manifest."),
     shard_size: int = typer.Option(1_000_000, "--shard-size", help="Max samples per shard."),
+    mirror: bool = typer.Option(
+        True, "--mirror/--no-mirror", help="Add the left-right mirror of every sample."
+    ),
+    color_augment: bool = typer.Option(
+        True,
+        "--color-augment/--no-color-augment",
+        help="Add the rotate-180 + colour-swap variant of every sample.",
+    ),
 ) -> None:
     """Parse games, encode per-ply board-state shards, and index in the manifest (WP5)."""
     created = datetime.now(UTC).isoformat(timespec="seconds")
-    stats = build_board_shards(iter_games_in(path), out, shard_size=shard_size, created=created)
+    stats = build_board_shards(
+        iter_games_in(path),
+        out,
+        shard_size=shard_size,
+        created=created,
+        mirror=mirror,
+        color_augment=color_augment,
+    )
     m = _load_manifest()
     # Register both tokenizers; board-v1 may be missing if no prior ingest-board was run.
     _register_tokenizers(m)
@@ -368,6 +383,7 @@ def data_ingest_board(
         ("Plies (samples)", stats.num_samples),
         ("Shards", len(stats.shards)),
         ("Skipped games", stats.skipped_games),
+        ("Augment factor", f"{stats.augment_factor}x (mirror={mirror}, color={color_augment})"),
         ("Board tokenizer", BoardTokenizer.id),
         ("Move tokenizer", MoveTokenizer.id),
     ):
