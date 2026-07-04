@@ -1,0 +1,65 @@
+---
+# deploy/verify-gpu.yml — Verify the GPU the provider actually gave us.
+#
+# Prints the REPORTED identity (nvidia-smi: name, VRAM, PCIe gen/width, clocks,
+# power limit) AND the MEASURED capability (matmul TFLOPS at fp64/fp32/tf32/
+# fp16/bf16 + VRAM bandwidth, via deploy/files/gpu_bench.py). A provider that
+# swaps in a weaker card is caught: measured tensor-core TFLOPS and memory
+# bandwidth reveal the true silicon regardless of the name string.
+#
+# Usage:
+#   cd deploy && ansible-playbook verify-gpu.yml
+#
+# No sudo needed. Needs the project venv on the server (torch) — run update.yml
+# once first if the box is fresh.
+
+- name: Dong Feng — Verify GPU (identity + measured throughput)
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+
+  tasks:
+    - name: nvidia-smi — reported identity, clocks, PCIe, power
+      shell: |
+        nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap,\
+        clocks.max.sm,clocks.max.mem,power.limit,pcie.link.gen.max,\
+        pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current,serial,uuid \
+        --format=csv,noheader
+      register: smi
+      changed_when: false
+
+    - name: Show reported identity
+      debug:
+        msg: |
+          Reported (name, VRAM MiB, driver, cc, max SM/mem clk, power lim,
+          PCIe gen/width max, PCIe gen/width current, serial, uuid):
+          {{ smi.stdout }}
+
+    - name: Copy the benchmark to the server
+      copy:
+        src: files/gpu_bench.py
+        dest: /tmp/gpu_bench.py
+        mode: "0644"
+
+    - name: Run the measured-throughput benchmark (uses the project venv/torch)
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        uv run python /tmp/gpu_bench.py
+      register: bench
+      changed_when: false
+
+    - name: Show measured throughput + verdict
+      debug:
+        msg: "{{ bench.stdout_lines }}"
+
+    - name: Fail loudly if the card looks mislabeled
+      when: "'SUSPICIOUS' in bench.stdout"
+      fail:
+        msg: >-
+          GPU verification FAILED — measured throughput is far below the
+          reference for the reported card. The provider may have supplied a
+          weaker GPU than advertised. See the table above.
