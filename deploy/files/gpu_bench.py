@@ -26,6 +26,7 @@ _REFERENCE: dict[str, dict[str, float]] = {
     "5090": {"bf16_tflops": 209, "fp16_tflops": 209, "tf32_tflops": 105, "membw_gbps": 1790, "vram_gb": 32},
     "5080": {"bf16_tflops": 112, "fp16_tflops": 112, "tf32_tflops": 56, "membw_gbps": 960, "vram_gb": 16},
     "5070": {"bf16_tflops": 62, "fp16_tflops": 62, "tf32_tflops": 31, "membw_gbps": 672, "vram_gb": 12},
+    "5060 ti": {"bf16_tflops": 48, "fp16_tflops": 48, "tf32_tflops": 24, "membw_gbps": 448, "vram_gb": 16},
     "5060": {"bf16_tflops": 48, "fp16_tflops": 48, "tf32_tflops": 24, "membw_gbps": 448, "vram_gb": 8},
     "4090": {"bf16_tflops": 165, "fp16_tflops": 165, "tf32_tflops": 83, "membw_gbps": 1008, "vram_gb": 24},
     "a100": {"bf16_tflops": 312, "fp16_tflops": 312, "tf32_tflops": 156, "membw_gbps": 1935, "vram_gb": 40},
@@ -106,8 +107,9 @@ def main() -> None:
         **results,
     }
 
-    # Flag mismatch vs known reference (if the name matches a known card).
-    ref_key = next((k for k in _REFERENCE if k in name.lower()), None)
+    # Flag mismatch vs known reference (longest matching key wins, so
+    # "5060 ti" beats "5060").
+    ref_key = max((k for k in _REFERENCE if k in name.lower()), key=len, default=None)
     verdict = "unknown-card (no reference to compare)"
     if ref_key:
         ref = _REFERENCE[ref_key]

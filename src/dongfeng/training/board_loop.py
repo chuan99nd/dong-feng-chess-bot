@@ -157,41 +157,28 @@ def _compute_loss(
     move_targets: torch.Tensor,
     value_targets: torch.Tensor,
     value_weight: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Compute combined loss (§1.7).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute combined loss (§1.7) with no host↔device sync.
 
-    Returns:
-        ``(total_loss, policy_loss, value_loss_or_None)``
-        value_loss is None when the entire batch is masked.
+    The value MSE is computed branchlessly over the samples whose target is not
+    the 127 mask sentinel: masked samples contribute exactly 0 to the loss and
+    its gradient, and an all-masked batch yields ``value_loss == 0`` (previously
+    ``None``). The data-dependent ``if mask.any()`` branch is gone — it forced a
+    GPU→CPU sync every step and blocked torch.compile/CUDA-graph capture.
+
+    The value term is computed in fp32: under autocast (fp16 on MPS, bf16 on
+    CUDA) ``value_pred`` is low-precision, and casting up keeps the MSE stable
+    (MPS also rejects the mixed-dtype subtract otherwise).
     """
     # Policy CE over full 2554 vocab — no masking at train time.
     policy_loss = F.cross_entropy(policy_logits, move_targets)
 
-    # Value MSE only where target != 127.
-    val_float = value_targets.float()  # −1 / 0 / +1 / 127
     mask = value_targets != _MASK_VALUE  # bool tensor [B]
-    if mask.any():
-        # Compute the value MSE in fp32: under autocast (fp16 on MPS, bf16 on
-        # CUDA) ``value_pred`` is low-precision while ``val_float`` is fp32, and
-        # MPS rejects the mixed-dtype subtract inside ``mse_loss``. Casting the
-        # prediction up also keeps the value loss numerically stable.
-        value_loss: torch.Tensor | None = F.mse_loss(
-            value_pred[mask].float(), val_float[mask], reduction="mean"
-        )
-    else:
-        value_loss = None
-
-    total = policy_loss + value_weight * value_loss if value_loss is not None else policy_loss
+    diff = value_pred.float() - value_targets.float()  # targets: −1 / 0 / +1 / 127
+    value_loss = (diff.pow(2) * mask).sum() / mask.sum().clamp(min=1)
+    total = policy_loss + value_weight * value_loss
 
     return total, policy_loss, value_loss
-
-
-def _autocast_ctx(device: str, dtype: torch.dtype) -> Any:
-    """Return a torch.autocast context manager, or a no-op on cpu/fp32."""
-    if dtype == torch.float32:
-        return torch.inference_mode.__class__  # dummy — overridden below
-    device_type = "cuda" if device.startswith("cuda") else device
-    return torch.autocast(device_type=device_type, dtype=dtype)
 
 
 def _profile_window(
@@ -312,6 +299,11 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
     device, dtype = resolve_device_dtype(config.device)
 
+    if device.startswith("cuda"):
+        # TF32 for any fp32 matmuls outside the bf16 autocast region (e.g. the
+        # fp32 value-loss path, grad-norm) — free throughput on Ampere+.
+        torch.set_float32_matmul_precision("high")
+
     # ------------------------------------------------------------------ model
     if config.config_override is not None:
         model_cfg = config.config_override
@@ -365,32 +357,61 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     val_idx = indices[:n_val]
     train_idx = indices[n_val:]
 
-    # Convert to tensors (keep on CPU — move per-batch to device).
-    boards_t = torch.from_numpy(boards_np.astype(np.int64))  # [N, 91]
-    moves_t = torch.from_numpy(moves_np.astype(np.int64))  # [N]
-    values_t = torch.from_numpy(values_np.astype(np.int64))  # [N]
+    # Keep the corpus in compact dtypes (boards uint8, moves int32, values int8)
+    # instead of int64 — 8× less RAM and copy bandwidth for a multi-million-sample
+    # corpus. Batches are widened to int64 on-device only where torch requires it.
+    boards_t = torch.from_numpy(np.ascontiguousarray(boards_np))  # [N, 91] uint8
+    moves_t = torch.from_numpy(moves_np.astype(np.int32))  # [N] int32
+    values_t = torch.from_numpy(np.ascontiguousarray(values_np))  # [N] int8
 
-    train_boards = boards_t[train_idx]
-    train_moves = moves_t[train_idx]
-    train_values = values_t[train_idx]
+    # T2: keep the whole corpus resident on the training device when it fits —
+    # this removes the per-step CPU gather + synchronous H2D copy from the hot
+    # loop entirely (2.5M samples ≈ 240 MB in compact dtypes).
+    data_bytes = boards_t.nbytes + moves_t.nbytes + values_t.nbytes
+    data_on_device = False
+    if device.startswith("cuda"):
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            data_on_device = data_bytes < 0.5 * free_bytes
+        except Exception:
+            data_on_device = False
+    elif device == "mps":
+        data_on_device = data_bytes < (2 << 30)  # unified memory; stay modest
+    if data_on_device:
+        boards_t = boards_t.to(device)
+        moves_t = moves_t.to(device)
+        values_t = values_t.to(device)
 
-    val_boards = boards_t[val_idx]
-    val_moves = moves_t[val_idx]
-    val_values = values_t[val_idx]
+    # corpus_has_values: computed once so per-step logging never has to inspect
+    # the mask (the loss itself is branchless — see _compute_loss).
+    corpus_has_values = bool((values_np != _MASK_VALUE).any())
+
+    train_idx_t = torch.from_numpy(train_idx).to(boards_t.device)
+    val_idx_t = torch.from_numpy(val_idx).to(boards_t.device)
+
+    train_boards = boards_t[train_idx_t]
+    train_moves = moves_t[train_idx_t]
+    train_values = values_t[train_idx_t]
+
+    val_boards = boards_t[val_idx_t]
+    val_moves = moves_t[val_idx_t]
+    val_values = values_t[val_idx_t]
 
     n_train = len(train_boards)
 
-    def _batch(
-        b_arr: torch.Tensor, m_arr: torch.Tensor, v_arr: torch.Tensor, step: int
+    def _fetch_batch(
+        b_arr: torch.Tensor, m_arr: torch.Tensor, v_arr: torch.Tensor, idx: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample a random batch from the given split."""
-        bs = min(config.batch_size, len(b_arr))
-        start = (step * bs) % max(len(b_arr) - bs, 1)
-        idx = torch.arange(start, start + bs) % len(b_arr)
+        """Gather a batch and place it on the device in the dtypes the loss needs.
+
+        With device-resident data only the tiny index tensor crosses the PCIe bus;
+        the gather and the uint8→int64 widening both run on the GPU.
+        """
+        idx = idx.to(b_arr.device, non_blocking=True)
         return (
-            b_arr[idx].to(device),
-            m_arr[idx].to(device),
-            v_arr[idx].to(device),
+            b_arr[idx].to(device, non_blocking=True).long(),
+            m_arr[idx].to(device, non_blocking=True).long(),
+            v_arr[idx].to(device, non_blocking=True),
         )
 
     # ------------------------------------------------------------------ optimizer
@@ -491,12 +512,6 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     # ------------------------------------------------------------------ autocast
     use_autocast = dtype != torch.float32
 
-    def _make_autocast() -> Any:
-        if not use_autocast:
-            return torch.no_grad().__class__()  # will use contextlib.nullcontext below
-        device_type = "cuda" if device.startswith("cuda") else device
-        return torch.autocast(device_type=device_type, dtype=dtype)
-
     from contextlib import nullcontext  # noqa: PLC0415
 
     def _forward_ctx():  # type: ignore[return]
@@ -519,8 +534,8 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         for bi in range(n_batches):
             s = bi * config.batch_size
             e = min(s + config.batch_size, len(val_boards))
-            vb = val_boards[s:e].to(device)
-            vm = val_moves[s:e].to(device)
+            vb = val_boards[s:e].to(device).long()
+            vm = val_moves[s:e].to(device).long()
             vv = val_values[s:e].to(device)
 
             with _forward_ctx():

@@ -1052,7 +1052,7 @@ async function loadProfile(runId){
       document.getElementById("training-profile-note").textContent = "Profiler error: "+data.error;
       return;
     }
-    const PEAK = 209; // RTX 5090 bf16 dense — same constant as the perf cards
+    const PEAK = 48; // RTX 5060 Ti bf16 dense ≈ 48 — same constant as the perf cards
     const mfu = data.measured_tflops!=null ? (data.measured_tflops/PEAK*100) : null;
     document.getElementById("training-profile-summary").innerHTML = [
       ["ms/step", data.ms_per_step!=null?data.ms_per_step+" ms":"—"],
@@ -1193,7 +1193,7 @@ function renderTrainingDetail(run, metrics){
   // Board model = fixed 91-token sequence. Training FLOPs ≈ 6·N·tokens (fwd+bwd).
   // Set GPU_PEAK_TFLOPS to your GPU's bf16 dense peak (RTX 5090 ≈ 209) to show MFU%.
   const SEQ_LEN = 91;
-  const GPU_PEAK_TFLOPS = 209;   // RTX 5090 bf16 (dense). Adjust for your GPU.
+  const GPU_PEAK_TFLOPS = 48;   // RTX 5060 Ti bf16 dense ≈ 48. Verify/adjust via verify-gpu.yml.
   const bs = (run.config && run.config.batch_size) ? Number(run.config.batch_size) : null;
   const nParams = run.params != null ? Number(run.params) : null;
   const samplesPerS = tps!=null ? tps/SEQ_LEN : null;
