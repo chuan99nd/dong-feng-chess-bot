@@ -1,0 +1,390 @@
+---
+# deploy/setup.yml — Bootstrap the GPU server for Dong Feng training + web UI.
+#
+# Usage:
+#   cd deploy && ansible-playbook setup.yml --ask-become-pass
+#
+# What it does:
+#   1. Install system deps (Python 3.11, git, CUDA toolkit)
+#   2. Install uv (the Python project manager)
+#   3. Clone the repo + sync deps (PyTorch cu128 for RTX 5090 / Blackwell)
+#   4. Upload training data shards
+#   5. Install & configure a NAMED cloudflared tunnel (behind Cloudflare Access)
+#   6. Set up systemd services for training + web UI
+#
+# Secure-tunnel prerequisites (run ONCE on your Mac before this playbook):
+#   cloudflared tunnel login
+#   cloudflared tunnel create dongfeng          # prints <TUNNEL_ID>, writes ~/.cloudflared/<TUNNEL_ID>.json
+#   cloudflared tunnel route dns dongfeng chess.chuantran.site
+# Then run this playbook with the tunnel id, e.g.:
+#   ansible-playbook setup.yml --ask-become-pass -e tunnel_id=<TUNNEL_ID>
+# Finally, protect the app in the Cloudflare Zero Trust dashboard:
+#   Access → Applications → Add self-hosted → chess.chuantran.site → Allow only your email/SSO.
+
+- name: Dong Feng — GPU server setup
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    repo_url: https://github.com/chuan99nd/dong-feng-chess-bot.git
+    repo_branch: feat/board-state-flagship
+    data_local: "{{ playbook_dir }}/../data/vietcotuong-board-aug"
+    data_remote: "{{ app_dir }}/data/vietcotuong-board-aug"
+    web_port: 8000
+    train_preset: mid
+    train_steps: 100000
+    train_batch: 256
+    gpu_tag: 5090
+    # PyTorch CUDA wheel index. RTX 5090 is Blackwell (sm_120) and needs CUDA 12.8+.
+    torch_index_url: https://download.pytorch.org/whl/cu128
+    # ── Cloudflare named tunnel (secure) ──
+    tunnel_name: dongfeng
+    tunnel_hostname: chess.chuantran.site
+    tunnel_id: "{{ lookup('env', 'TUNNEL_ID') | default('', true) }}"
+    cloudflared_cred_local: "{{ lookup('env', 'HOME') }}/.cloudflared/{{ tunnel_id }}.json"
+    cloudflared_dir_remote: "/home/{{ app_user }}/.cloudflared"
+    # ── Durable checkpoint backup (Cloudflare R2, S3-compatible) ──
+    # Pass these at runtime (never commit): -e r2_account_id=... etc, or export as env.
+    # When r2_bucket is empty, all backup/restore tasks are skipped.
+    r2_bucket: "{{ lookup('env', 'R2_BUCKET') | default('', true) }}"
+    r2_account_id: "{{ lookup('env', 'R2_ACCOUNT_ID') | default('', true) }}"
+    r2_access_key: "{{ lookup('env', 'R2_ACCESS_KEY_ID') | default('', true) }}"
+    r2_secret_key: "{{ lookup('env', 'R2_SECRET_ACCESS_KEY') | default('', true) }}"
+    r2_prefix: dongfeng
+    backup_every_min: 10
+    rclone_conf_remote: "/home/{{ app_user }}/.config/rclone/rclone.conf"
+
+  tasks:
+    # ── 1. System packages ──────────────────────────────────────────────
+    - name: Install system dependencies
+      apt:
+        name:
+          - git
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - build-essential
+          - curl
+          - tmux
+          - htop
+          - nvtop
+        state: present
+        update_cache: true
+
+    # ── 2. uv (Python project manager) ─────────────────────────────────
+    - name: Check if uv is installed
+      command: /home/{{ app_user }}/.local/bin/uv --version
+      register: uv_check
+      ignore_errors: true
+      become_user: "{{ app_user }}"
+
+    - name: Install uv
+      shell: curl -LsSf https://astral.sh/uv/install.sh | sh
+      become_user: "{{ app_user }}"
+      when: uv_check.rc != 0
+
+    # ── 3. Clone repo ──────────────────────────────────────────────────
+    - name: Clone / update Dong Feng repo
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: true
+      become_user: "{{ app_user }}"
+
+    - name: Create data + checkpoints + runs directories
+      file:
+        path: "{{ app_dir }}/{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+      loop:
+        - data
+        - checkpoints
+        - runs
+
+    # ── 3b. Durable backup: rclone → Cloudflare R2 + restore ───────────
+    - name: Install rclone (for R2 backup)
+      apt:
+        name: rclone
+        state: present
+      when: r2_bucket | length > 0
+
+    - name: Ensure rclone config dir (locked down)
+      file:
+        path: "/home/{{ app_user }}/.config/rclone"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0700"
+      when: r2_bucket | length > 0
+
+    - name: Write rclone.conf for R2 (0600, secrets never world-readable)
+      copy:
+        dest: "{{ rclone_conf_remote }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = {{ r2_access_key }}
+          secret_access_key = {{ r2_secret_key }}
+          endpoint = https://{{ r2_account_id }}.r2.cloudflarestorage.com
+          acl = private
+      when: r2_bucket | length > 0
+
+    - name: Restore checkpoints + runs from R2 (resume prior progress)
+      shell: |
+        export HOME=/home/{{ app_user }}
+        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints {{ app_dir }}/checkpoints --create-empty-src-dirs
+        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/runs {{ app_dir }}/runs --create-empty-src-dirs
+      become_user: "{{ app_user }}"
+      when: r2_bucket | length > 0
+      ignore_errors: true
+
+
+    - name: Sync Python dependencies (includes PyTorch + CUDA)
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        uv sync --extra model --extra dev
+      become_user: "{{ app_user }}"
+      environment:
+        UV_PYTHON: python3.11
+
+    - name: Install PyTorch built for CUDA 12.8 (RTX 5090 / Blackwell sm_120)
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        uv pip install --python .venv/bin/python \
+          --index-url {{ torch_index_url }} torch
+      become_user: "{{ app_user }}"
+      environment:
+        UV_PYTHON: python3.11
+
+    - name: Verify PyTorch sees CUDA
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        uv run python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"
+      become_user: "{{ app_user }}"
+      register: torch_check
+
+    - name: Show PyTorch CUDA status
+      debug:
+        var: torch_check.stdout_lines
+
+    # ── 5. Upload training data ────────────────────────────────────────
+    - name: Upload training data shards
+      synchronize:
+        src: "{{ data_local }}/"
+        dest: "{{ data_remote }}/"
+        rsync_opts:
+          - "--progress"
+      become_user: "{{ app_user }}"
+
+    # ── 6. Cloudflared named tunnel (secure) ───────────────────────────
+    - name: Fail early if tunnel_id was not provided
+      assert:
+        that:
+          - tunnel_id | length > 0
+        fail_msg: >-
+          tunnel_id is empty. Create the tunnel on your Mac first
+          (cloudflared tunnel create {{ tunnel_name }}), then re-run with
+          -e tunnel_id=<TUNNEL_ID> (or export TUNNEL_ID).
+
+    - name: Ensure local tunnel credential file exists
+      delegate_to: localhost
+      become: false
+      stat:
+        path: "{{ cloudflared_cred_local }}"
+      register: cred_stat
+
+    - name: Fail if the credential file is missing
+      assert:
+        that:
+          - cred_stat.stat.exists
+        fail_msg: >-
+          Credential file {{ cloudflared_cred_local }} not found. Run
+          `cloudflared tunnel create {{ tunnel_name }}` on this Mac first.
+
+    - name: Check if cloudflared is installed
+      command: cloudflared --version
+      register: cf_check
+      ignore_errors: true
+
+    - name: Install cloudflared
+      shell: |
+        curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+        dpkg -i /tmp/cloudflared.deb
+        rm /tmp/cloudflared.deb
+      when: cf_check.rc != 0
+
+    - name: Create ~/.cloudflared dir (locked down)
+      file:
+        path: "{{ cloudflared_dir_remote }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0700"
+
+    - name: Upload tunnel credentials (0600, never world-readable)
+      copy:
+        src: "{{ cloudflared_cred_local }}"
+        dest: "{{ cloudflared_dir_remote }}/{{ tunnel_id }}.json"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+
+    - name: Write cloudflared tunnel config (ingress → loopback web UI)
+      copy:
+        dest: "{{ cloudflared_dir_remote }}/config.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          tunnel: {{ tunnel_id }}
+          credentials-file: {{ cloudflared_dir_remote }}/{{ tunnel_id }}.json
+          ingress:
+            - hostname: {{ tunnel_hostname }}
+              service: http://127.0.0.1:{{ web_port }}
+            - service: http_status:404
+
+    # ── 7. Systemd: Web UI ─────────────────────────────────────────────
+    - name: Create web UI systemd service
+      copy:
+        dest: /etc/systemd/system/dongfeng-web.service
+        content: |
+          [Unit]
+          Description=Dong Feng Chess Web UI
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc web --engine board --host 127.0.0.1 --port {{ web_port }} --no-open
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 8. Systemd: Training ───────────────────────────────────────────
+    - name: Create training systemd service
+      copy:
+        dest: /etc/systemd/system/dongfeng-train.service
+        content: |
+          [Unit]
+          Description=Dong Feng Board Transformer Training
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id board-{{ gpu_tag }}-run1
+          Restart=no
+          StandardOutput=append:/home/{{ app_user }}/dong-feng/runs/train.log
+          StandardError=append:/home/{{ app_user }}/dong-feng/runs/train.log
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 8b. Systemd: durable checkpoint backup (R2) ────────────────────
+    - name: Create checkpoint-sync systemd service (push to R2)
+      copy:
+        dest: /etc/systemd/system/dongfeng-ckpt-sync.service
+        content: |
+          [Unit]
+          Description=Dong Feng checkpoint backup to Cloudflare R2
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          User={{ app_user }}
+          Environment=HOME=/home/{{ app_user }}
+          ExecStart=/usr/bin/rclone sync {{ app_dir }}/checkpoints r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints --create-empty-src-dirs
+          ExecStartPost=/usr/bin/rclone sync {{ app_dir }}/runs r2:{{ r2_bucket }}/{{ r2_prefix }}/runs --create-empty-src-dirs
+      when: r2_bucket | length > 0
+      notify: reload systemd
+
+    - name: Create checkpoint-sync systemd timer
+      copy:
+        dest: /etc/systemd/system/dongfeng-ckpt-sync.timer
+        content: |
+          [Unit]
+          Description=Periodic Dong Feng checkpoint backup to R2
+
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec={{ backup_every_min }}min
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+      when: r2_bucket | length > 0
+      notify: reload systemd
+
+    # ── 9. Cloudflared tunnel service ──────────────────────────────────
+    - name: Create cloudflared tunnel systemd service
+      copy:
+        dest: /etc/systemd/system/dongfeng-tunnel.service
+        content: |
+          [Unit]
+          Description=Cloudflare Tunnel for Dong Feng Web UI
+          After=dongfeng-web.service network-online.target
+          Requires=dongfeng-web.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate --config {{ cloudflared_dir_remote }}/config.yml run {{ tunnel_name }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 10. Enable & start services ────────────────────────────────────
+    - name: Enable and start web UI
+      systemd:
+        name: dongfeng-web
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Enable and start cloudflared tunnel
+      systemd:
+        name: dongfeng-tunnel
+        enabled: true
+        state: restarted
+
+    - name: Enable and start checkpoint-sync timer
+      systemd:
+        name: dongfeng-ckpt-sync.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+      when: r2_bucket | length > 0
+
+    - name: Show public URL
+      debug:
+        msg: >-
+          Web UI is served at https://{{ tunnel_hostname }} (protected by
+          Cloudflare Access). Make sure you've added an Access application for
+          this hostname in the Zero Trust dashboard, allowing only your identity.
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true

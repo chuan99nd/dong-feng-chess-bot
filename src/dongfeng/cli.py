@@ -554,6 +554,11 @@ def train_board(
         "--optim",
         help="Optimizer: adamw (default) or adam8bit (cuda-only; needs bitsandbytes).",
     ),
+    resume: str = typer.Option(
+        "",
+        "--resume",
+        help="Path to a ckpt.pt to warm-resume from (e.g. after an ephemeral restart).",
+    ),
     smoke: bool = typer.Option(
         False, "--smoke", help="Build model, 2 fwd+bwd on random data, print params, exit 0."
     ),
@@ -628,12 +633,22 @@ def train_board(
         f"Training board model [bold]{checkpoint_id!r}[/bold] "
         f"preset={preset!r} steps={max_steps} device={resolved_device}"
     )
-
     override = None
     if n_bias_head:
         _presets = BoardTransformerConfig.presets()
         if preset in _presets:
             override = replace(_presets[preset], n_bias_head=n_bias_head)
+
+    # Resume: use the explicit path if given, otherwise auto-resume from an
+    # existing ckpt.pt in the run dir (so a restarted systemd/ephemeral run
+    # continues instead of starting over).
+    resume_path: str | None = resume or None
+    if resume_path is None:
+        auto = Path(resolved_out) / "ckpt.pt"
+        if auto.exists():
+            resume_path = str(auto)
+    if resume_path is not None:
+        _console.print(f"[yellow]Resuming from[/yellow] {resume_path}")
 
     cfg = BoardTrainConfig(
         data_dir=Path(data_dir),
@@ -650,6 +665,7 @@ def train_board(
         grad_checkpoint=grad_checkpoint,
         eval_every=eval_every,
         optim=optim,
+        resume=resume_path,
         config_override=override,
     )
     ckpt = bc_train_board(cfg)

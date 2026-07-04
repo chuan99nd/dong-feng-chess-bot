@@ -1,0 +1,64 @@
+---
+# deploy/monitor.yml — Quick health check of all Dong Feng services.
+#
+# Usage:
+#   cd deploy && ansible-playbook monitor.yml
+
+- name: Dong Feng — Monitor services
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    tunnel_hostname: chess.chuantran.site
+
+  tasks:
+    - name: GPU status
+      shell: nvidia-smi
+      register: gpu_status
+
+    - name: Show GPU
+      debug:
+        var: gpu_status.stdout_lines
+
+    - name: Service statuses
+      shell: |
+        echo "=== dongfeng-web ==="
+        systemctl is-active dongfeng-web
+        echo "=== dongfeng-train ==="
+        systemctl is-active dongfeng-train
+        echo "=== dongfeng-tunnel ==="
+        systemctl is-active dongfeng-tunnel
+      register: svc_status
+      ignore_errors: true
+
+    - name: Show services
+      debug:
+        var: svc_status.stdout_lines
+
+    - name: Training log (last 30 lines)
+      shell: tail -30 {{ app_dir }}/runs/train.log 2>/dev/null || echo "No training log yet"
+      register: train_log
+
+    - name: Show training log
+      debug:
+        var: train_log.stdout_lines
+
+    - name: Tunnel connections (named tunnel health)
+      shell: journalctl -u dongfeng-tunnel --no-pager -n 40 | grep -iE 'Registered tunnel connection|ERR|error' | tail -5 || echo "no recent tunnel log"
+      register: tunnel_log
+      ignore_errors: true
+
+    - name: Show tunnel status
+      debug:
+        msg:
+          - "Public URL: https://{{ tunnel_hostname }} (behind Cloudflare Access)"
+          - "{{ tunnel_log.stdout_lines | default([]) }}"
+
+    - name: Disk usage
+      shell: df -h / | tail -1 && echo "---" && du -sh {{ app_dir }}/runs/ {{ app_dir }}/checkpoints/ {{ app_dir }}/data/ 2>/dev/null
+      register: disk
+
+    - name: Show disk
+      debug:
+        var: disk.stdout_lines

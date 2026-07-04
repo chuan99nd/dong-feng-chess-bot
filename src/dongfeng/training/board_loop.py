@@ -116,6 +116,15 @@ class BoardTrainConfig:
     ``bitsandbytes`` is not installed or the device is not CUDA, the trainer
     emits a warning and falls back to AdamW automatically.
     """
+    resume: str | Path | None = None
+    """Optional path to a ``ckpt.pt`` to resume from.
+
+    When set, the model is rebuilt from the checkpoint's saved config (not the
+    preset) and its weights are loaded; training continues from ``step + 1`` and
+    the best-val bar is seeded from the checkpoint. Enables warm restarts on
+    ephemeral machines. Optimizer momentum is not restored (the LR schedule is
+    recomputed from the resumed step).
+    """
     config_override: BoardTransformerConfig | None = field(default=None, repr=False)
 
 
@@ -213,7 +222,17 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     model_cfg.gradient_checkpointing = config.grad_checkpoint
 
     torch.manual_seed(config.seed)
-    model = BoardTransformer(model_cfg)
+    # Resume: rebuild from the checkpoint's own config so shapes always match,
+    # then continue from the saved step. Falls back to a fresh model otherwise.
+    resume_step = 0
+    resume_best_val = float("inf")
+    if config.resume is not None and Path(config.resume).exists():
+        model, resume_extra = BoardTransformer.load(config.resume, map_location="cpu")
+        model.config.gradient_checkpointing = config.grad_checkpoint
+        resume_step = int(resume_extra.get("step", -1)) + 1
+        resume_best_val = float(resume_extra.get("val_policy_loss", float("inf")))
+    else:
+        model = BoardTransformer(model_cfg)
     model.to(device)
     model.train()
 
@@ -389,14 +408,14 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         return total_loss_acc / n, total_policy_acc / n, total_correct / n
 
     # ------------------------------------------------------------------ train loop
-    best_val_policy = float("inf")
+    best_val_policy = resume_best_val
     step_0_loss: float | None = None
     t_start = time.time()
     gen = torch.Generator()
     gen.manual_seed(config.seed)
 
     try:
-        for step in range(config.max_steps):
+        for step in range(resume_step, config.max_steps):
             lr = _lr_at(step, config.warmup, config.max_steps, config.lr)
             for pg in opt.param_groups:
                 pg["lr"] = lr

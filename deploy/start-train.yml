@@ -1,0 +1,69 @@
+---
+# deploy/start-train.yml — Start (or restart) training on the GPU server.
+#
+# Usage:
+#   cd deploy && ansible-playbook start-train.yml --ask-become-pass
+#   cd deploy && ansible-playbook start-train.yml --ask-become-pass -e train_preset=1b -e train_steps=50000
+#
+# Training auto-resumes: dfc train-board detects an existing runs/<id>/ckpt.pt
+# and continues from its step. On a fresh ephemeral machine, this playbook first
+# pulls the latest checkpoint back from R2 (if R2_* env/vars are set).
+
+- name: Dong Feng — Start training
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    data_remote: "{{ app_dir }}/data/vietcotuong-board-aug"
+    train_preset: mid
+    train_steps: 100000
+    train_batch: 256
+    gpu_tag: 5090
+    r2_bucket: "{{ lookup('env', 'R2_BUCKET') | default('', true) }}"
+    r2_prefix: dongfeng
+
+  tasks:
+    - name: Restore checkpoints + runs from R2 (so training can resume)
+      shell: |
+        export HOME=/home/{{ app_user }}
+        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints {{ app_dir }}/checkpoints --create-empty-src-dirs
+        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/runs {{ app_dir }}/runs --create-empty-src-dirs
+      become_user: "{{ app_user }}"
+      when: r2_bucket | length > 0
+      ignore_errors: true
+
+    - name: Update training service with current params
+      copy:
+        dest: /etc/systemd/system/dongfeng-train.service
+        content: |
+          [Unit]
+          Description=Dong Feng Board Transformer Training
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id board-{{ gpu_tag }}-{{ train_preset }}
+          Restart=no
+          StandardOutput=append:{{ app_dir }}/runs/train.log
+          StandardError=append:{{ app_dir }}/runs/train.log
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Restart training service
+      systemd:
+        name: dongfeng-train
+        state: restarted
+        daemon_reload: true
+
+    - name: Show training status
+      shell: sleep 3 && systemctl status dongfeng-train --no-pager -l | head -20
+      register: train_status
+
+    - name: Display status
+      debug:
+        var: train_status.stdout_lines

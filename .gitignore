@@ -31,6 +31,19 @@ htmlcov/
 # Engines / nets (large binaries)
 *.nnue
 
+# Deploy secrets
+deploy/inventory.ini
+deploy/*.vault
+deploy/secrets/
+# Cloudflare Tunnel credentials (never commit)
+*.pem
+cert.pem
+**/.cloudflared/
+deploy/cloudflared/
+# rclone / R2 credentials (never commit)
+rclone.conf
+deploy/rclone.conf
+
 # OS / editor
 .DS_Store
 *.swp

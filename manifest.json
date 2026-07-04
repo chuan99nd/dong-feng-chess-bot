@@ -51,7 +51,34 @@
       "vocab_size": 21
     }
   ],
-  "datasets": [],
-  "checkpoints": [],
+  "datasets": [
+    {
+      "id": "vietcotuong-board-aug",
+      "path": "data/vietcotuong-board-aug",
+      "source": "selected-games",
+      "format": "board-ds-v1",
+      "schema": "board-ds-v1",
+      "num_games": 9374,
+      "num_samples": 2511268,
+      "skipped": 68,
+      "tokenizer": "board-v1",
+      "created": "2026-07-04T01:38:57+00:00",
+      "notes": "2511268 samples across 3 shard(s); 68 game(s) skipped; move_tokenizer move-v1"
+    }
+  ],
+  "checkpoints": [
+    {
+      "id": "wp-aug-bias-300",
+      "path": "runs/wp-aug-bias-300/ckpt.pt",
+      "kind": "bc-board",
+      "preset": "m1-dev",
+      "params": 24644160,
+      "step": 300,
+      "run_id": "wp-aug-bias-300",
+      "tokenizer": "board-v1",
+      "metrics": {},
+      "created": "2026-07-04T01:52:05+00:00"
+    }
+  ],
   "runs": []
 }

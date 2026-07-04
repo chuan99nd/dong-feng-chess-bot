@@ -255,3 +255,41 @@ def test_run_json_required_fields(tmp_path: Path, board_data_dir: Path) -> None:
     missing = required - meta.keys()
     assert not missing, f"run.json missing fields: {missing}"
     assert isinstance(meta["params"], int) and meta["params"] > 0
+
+
+def test_resume_continues_from_saved_step(tmp_path: Path, board_data_dir: Path) -> None:
+    """Resuming from a ckpt continues from the saved step instead of restarting."""
+    from dongfeng.training.board_loop import BoardTrainConfig, bc_train_board
+
+    out_dir = tmp_path / "run_resume"
+    common = dict(
+        data_dir=board_data_dir,
+        out_dir=out_dir,
+        preset="m1-dev",
+        id="test-resume",
+        batch_size=8,
+        lr=1e-3,
+        warmup=1,
+        device="cpu",
+        seed=7,
+        eval_every=5,
+        config_override=_tiny_model_config(),
+    )
+
+    # First leg: train 10 steps and save a checkpoint.
+    ckpt_path = bc_train_board(BoardTrainConfig(max_steps=10, **common))  # type: ignore[arg-type]
+    assert ckpt_path.exists()
+
+    def _max_val_step() -> int:
+        lines = [
+            json.loads(raw)
+            for raw in (out_dir / "metrics.jsonl").read_text().splitlines()
+            if raw.strip()
+        ]
+        return max(row["step"] for row in lines if row["split"] == "val")
+
+    # Second leg: resume to 20 steps; new val metrics must exceed the first leg's.
+    first_leg_last = _max_val_step()
+    bc_train_board(BoardTrainConfig(max_steps=20, resume=str(ckpt_path), **common))  # type: ignore[arg-type]
+    assert _max_val_step() > first_leg_last, "Resume did not advance past the saved step"
+
