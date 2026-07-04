@@ -9,6 +9,8 @@ The browser renders the board (SVG) and posts moves to a tiny JSON API:
 * ``POST /api/move``            -> apply a human move, then the engine's reply
 * ``POST /api/engine/shutdown`` -> unload the inference model (free memory for training)
 * ``POST /api/engine/start``    -> reload the inference model after a shutdown
+* ``POST /api/engine/reload``   -> hot-swap the engine to a different checkpoint
+* ``GET  /api/checkpoints``     -> list runs with a saved ckpt.pt (for hot-reload)
 * ``GET  /api/training``        -> list all training runs (newest first)
 * ``GET  /api/training?id=X``   -> detail for run X with downsampled metrics
 
@@ -45,7 +47,7 @@ def _make_engine(name: str, checkpoint: str | None) -> Engine:
         from ..inference.board_engine import BoardTransformerEngine  # noqa: PLC0415
 
         return BoardTransformerEngine(
-            checkpoint=os.environ.get("DONGFENG_BOARD_CKPT") or None,
+            checkpoint=checkpoint or os.environ.get("DONGFENG_BOARD_CKPT") or None,
             device="auto",
         )
     from ..engines import RandomEngine  # noqa: PLC0415
@@ -132,6 +134,33 @@ class GameSession:
                 self._configure_engine()
             return self._state()
 
+    def reload_engine(self, checkpoint: str | None) -> dict[str, Any]:
+        """Hot-swap the engine to a different checkpoint, preserving the game.
+
+        Drops the current engine (freeing its device memory), then loads
+        ``checkpoint`` (or the env default when ``None``) for the same engine
+        kind. On failure the previous checkpoint is restored and the engine is
+        left unloaded; the error is returned alongside the game state.
+        """
+        with self._lock:
+            if self.engine is not None:
+                with contextlib.suppress(Exception):
+                    self.engine.stop()
+                self.engine = None
+                _free_torch_memory()
+            prev = self._checkpoint
+            self._checkpoint = checkpoint
+            try:
+                self.engine = _make_engine(self.engine_name, self._checkpoint)
+                self.engine.new_game()
+                self._configure_engine()
+            except Exception as exc:  # keep the server alive on a bad checkpoint
+                self._checkpoint = prev
+                self.engine = None
+                _free_torch_memory()
+                return {"error": f"failed to load checkpoint: {exc}", "state": self._state()}
+            return self._state()
+
     def _engine_reply(self) -> str | None:
         if self.engine is None:
             return None
@@ -190,6 +219,7 @@ class GameSession:
             "human": self.human.value,
             "engine": self.engine_name,
             "engine_loaded": self.engine is not None,
+            "checkpoint": self._checkpoint,
             "temperature": self.temperature,
             "last_move": self.last_move,
         }
@@ -322,6 +352,36 @@ def _list_models() -> list[dict[str, Any]]:
     return result
 
 
+def _list_checkpoints() -> list[dict[str, Any]]:
+    """List runs that have a saved ``ckpt.pt`` (newest first) for hot-reload.
+
+    Each entry carries just enough to label the checkpoint in the UI; the
+    ``path`` is what :meth:`GameSession.reload_engine` loads.
+    """
+    out: list[dict[str, Any]] = []
+    for r in _list_runs():
+        run_id = str(r.get("id") or "")
+        if not run_id:
+            continue
+        path = _runs_root() / run_id / "ckpt.pt"
+        if not path.is_file():
+            continue
+        lv = r.get("last_val") or {}
+        out.append(
+            {
+                "id": run_id,
+                "path": str(path),
+                "preset": r.get("preset"),
+                "params": r.get("params"),
+                "arch_hash": r.get("arch_hash"),
+                "status": r.get("status"),
+                "top1": lv.get("top1"),
+                "step": (r.get("last_train") or {}).get("step"),
+            }
+        )
+    return out
+
+
 def _downsample(rows: list[dict[str, Any]], max_pts: int = 500) -> list[dict[str, Any]]:
     """Uniformly downsample a list to at most max_pts entries."""
     n = len(rows)
@@ -435,6 +495,8 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                     self._send_json({"runs": _list_runs()})
             elif self.path == "/api/models":
                 self._send_json({"models": _list_models()})
+            elif self.path == "/api/checkpoints":
+                self._send_json({"checkpoints": _list_checkpoints()})
             elif self.path == "/api/system":
                 self._send_json(_get_system_info())
             else:
@@ -458,6 +520,14 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 self._send_json(session.shutdown_engine())
             elif self.path == "/api/engine/start":
                 self._send_json(session.start_engine())
+            elif self.path == "/api/engine/reload":
+                raw = data.get("checkpoint")
+                ckpt = str(raw) if raw else None
+                # Only load a checkpoint the server discovered (localhost-dev safety).
+                if ckpt is not None and ckpt not in {c["path"] for c in _list_checkpoints()}:
+                    self._send_json({"error": "unknown checkpoint", "state": session.state()}, 400)
+                else:
+                    self._send_json(session.reload_engine(ckpt))
             else:
                 self.send_error(404)
 
@@ -592,6 +662,14 @@ _HTML = r"""<!doctype html>
       <div class="row" style="margin-top:10px;">
         <button id="engine-toggle" class="secondary">Tắt engine (nhường RAM cho training)</button>
       </div>
+      <label style="margin-top:10px;">Checkpoint (hot-reload)</label>
+      <select id="ckpt-select">
+        <option value="">-- mặc định (env) --</option>
+      </select>
+      <div class="row" style="margin-top:8px;">
+        <button id="ckpt-reload" class="secondary">Nạp checkpoint này</button>
+      </div>
+      <div class="muted" id="ckpt-current" style="margin-top:6px;"></div>
     </div>
     <div class="card">
       <label>Nước đi (ICCS)</label>
@@ -778,7 +856,7 @@ async function move(frm,to){ busy=true; setStatus("Máy đang nghĩ…");
   if(j.error){ setStatus("⚠ "+j.error); return; }
   state=j.state; sel=null; render(); update(); }
 
-async function refresh(){ state=await(await fetch("/api/state")).json(); render(); update(); }
+async function refresh(){ state=await(await fetch("/api/state")).json(); render(); update(); loadCheckpoints(); }
 async function newGame(){ busy=true; sel=null; setStatus("Đang tạo ván…");
   const body={engine:document.getElementById("engine").value,human:document.getElementById("human").value,
     temperature:parseFloat(document.getElementById("temp").value)};
@@ -799,6 +877,9 @@ function update(){
   const et=document.getElementById("engine-toggle");
   if(state.engine_loaded===false){ et.textContent="Bật engine"; et.classList.add("active"); }
   else { et.textContent="Tắt engine (nhường RAM cho training)"; et.classList.remove("active"); }
+  const cc=document.getElementById("ckpt-current");
+  if(cc){ cc.textContent = "Đang dùng: " + (state.checkpoint
+    ? state.checkpoint.split("/").slice(-2).join("/") : "mặc định (env)"); }
 }
 async function undo(){ if(busy||!state) return; busy=true; sel=null; setStatus("Đang đi lại…");
   state=await(await fetch("/api/undo",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
@@ -807,10 +888,37 @@ async function toggleEngine(){ if(busy||!state) return; busy=true;
   const path=state.engine_loaded===false?"/api/engine/start":"/api/engine/shutdown";
   setStatus(state.engine_loaded===false?"Đang bật engine…":"Đang tắt engine…");
   state=await(await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
-  busy=false; render(); update(); }
+  busy=false; render(); update(); loadCheckpoints(); }
+
+async function loadCheckpoints(){
+  try{
+    const data=await(await fetch("/api/checkpoints")).json();
+    const sel=document.getElementById("ckpt-select");
+    const cur=state?state.checkpoint:null;
+    sel.innerHTML='<option value="">-- mặc định (env) --</option>';
+    for(const c of (data.checkpoints||[])){
+      const opt=document.createElement("option"); opt.value=c.path;
+      const p=c.params!=null?" · "+(c.params/1e6).toFixed(1)+"M":"";
+      const t1=c.top1!=null?" · top1="+Number(c.top1).toFixed(3):"";
+      opt.textContent=`${c.id} [${c.status||"?"}]${p}${t1}`;
+      if(c.path===cur) opt.selected=true;
+      sel.appendChild(opt);
+    }
+  }catch(e){ console.error("checkpoints error",e); }
+}
+async function reloadCkpt(){ if(busy||!state) return; busy=true;
+  const ckpt=document.getElementById("ckpt-select").value||null;
+  setStatus("Đang nạp checkpoint…");
+  const j=await(await fetch("/api/engine/reload",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({checkpoint:ckpt})})).json();
+  busy=false;
+  if(j.error){ setStatus("⚠ "+j.error); if(j.state){ state=j.state; render(); update(); } return; }
+  state=j; render(); update(); }
+
 document.getElementById("new").addEventListener("click",newGame);
 document.getElementById("undo").addEventListener("click",undo);
 document.getElementById("engine-toggle").addEventListener("click",toggleEngine);
+document.getElementById("ckpt-reload").addEventListener("click",reloadCkpt);
 document.getElementById("temp").addEventListener("input",e=>document.getElementById("tval").textContent=e.target.value);
 refresh();
 
