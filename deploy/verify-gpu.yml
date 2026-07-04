@@ -38,23 +38,45 @@
           PCIe gen/width max, PCIe gen/width current, serial, uuid):
           {{ smi.stdout }}
 
+    - name: Install uv if missing (Astral installer → ~/.local/bin/uv)
+      shell: |
+        set -e
+        if [ ! -x "$HOME/.local/bin/uv" ] && ! command -v uv >/dev/null 2>&1; then
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+        fi
+      args:
+        creates: /home/{{ app_user }}/.local/bin/uv
+
     - name: Copy the benchmark to the server
       copy:
         src: files/gpu_bench.py
         dest: /tmp/gpu_bench.py
         mode: "0644"
 
-    - name: Run the measured-throughput benchmark (uses the project venv/torch)
+    - name: Run the measured-throughput benchmark (ephemeral torch env via uv)
+      # --no-project + --with torch: works on a BARE box (no repo/venv needed);
+      # uv fetches a Python + the CUDA torch wheel into a cached temp env.
+      # First run downloads torch (~minutes); subsequent runs are cached.
       shell: |
         export PATH="/home/{{ app_user }}/.local/bin:$PATH"
-        cd {{ app_dir }}
-        uv run python /tmp/gpu_bench.py
+        uv run --no-project --with torch python /tmp/gpu_bench.py
       register: bench
       changed_when: false
+      failed_when: false
 
-    - name: Show measured throughput + verdict
+    - name: Show measured throughput + verdict (stdout)
       debug:
         msg: "{{ bench.stdout_lines }}"
+
+    - name: Show benchmark errors (if any)
+      when: bench.rc != 0
+      debug:
+        msg: "{{ bench.stderr_lines }}"
+
+    - name: Fail if the benchmark could not run
+      when: bench.rc != 0
+      fail:
+        msg: "GPU benchmark failed (rc={{ bench.rc }}). See stderr above."
 
     - name: Fail loudly if the card looks mislabeled
       when: "'SUSPICIOUS' in bench.stdout"
