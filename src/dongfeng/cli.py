@@ -719,14 +719,18 @@ def eval_accuracy(
 
 @eval_app.command("arena")
 def eval_arena(
-    ckpt: str = typer.Option(..., "--ckpt", help="Checkpoint path for the engine under test."),
+    ckpt: str | None = typer.Option(
+        None, "--ckpt", help="Checkpoint path for the engine under test (random-init if unset)."
+    ),
     games: int = typer.Option(20, "--games"),
     opponent: str = typer.Option("random", "--opponent"),
     device: str = typer.Option("cpu", "--device"),
     seed: int = typer.Option(0, "--seed"),
     engine_kind: str = typer.Option(
-        "neural", "--engine-kind", help="Engine under test: neural | board."
+        "neural", "--engine-kind", help="Engine under test: neural | board | board-mcts."
     ),
+    sims: int = typer.Option(200, "--sims", help="MCTS simulations per move (board-mcts only)."),
+    c_puct: float = typer.Option(2.0, "--c-puct", help="PUCT exploration (board-mcts only)."),
 ) -> None:
     """Play the engine under test vs a baseline and report W/D/L + estimated Elo."""
     from .eval import play_match  # noqa: PLC0415
@@ -735,12 +739,22 @@ def eval_arena(
         from .inference.board_engine import BoardTransformerEngine  # noqa: PLC0415
 
         under_test: Engine = BoardTransformerEngine(checkpoint=ckpt, device=device)
+    elif engine_kind == "board-mcts":
+        from .inference.mcts_board import MctsBoardEngine  # noqa: PLC0415
+
+        under_test = MctsBoardEngine(
+            checkpoint=ckpt, device=device, c_puct=c_puct, n_simulations=sims
+        )
     elif engine_kind == "neural":
         from .inference.transformer_engine import TransformerEngine  # noqa: PLC0415
 
+        if ckpt is None:
+            raise typer.BadParameter("--ckpt is required for engine-kind neural")
         under_test = TransformerEngine(ckpt, device=device)
     else:
-        raise typer.BadParameter(f"unknown engine-kind {engine_kind!r}; choose neural | board")
+        raise typer.BadParameter(
+            f"unknown engine-kind {engine_kind!r}; choose neural | board | board-mcts"
+        )
 
     baseline = _make_engine(opponent, seed=seed)
     res = play_match(under_test, baseline, games=games, limits=SearchLimits(movetime_ms=10))
