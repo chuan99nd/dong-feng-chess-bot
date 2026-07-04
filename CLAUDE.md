@@ -49,10 +49,10 @@ Everything runs through `uv`. There is no `pip install`; use `uv sync`.
 | `uv run dfc ucci`                          | Speak the UCCI/UCI text protocol on stdin/stdout.        |
 | `uv run dfc eval ...`                      | Run an Elo arena / strength eval (M2+).                  |
 | `uv run dfc data ...`                      | Corpus ingestion + tokenization (M1).                    |
-| `uv run dfc data ingest-board ...`         | Ingest → fixed-length 91-token board shards (M3.5).      |
+| `uv run dfc data ingest-board ... [--mirror] [--color-augment]` | Ingest → 91-token board shards; ×2/×4 mirror+colour augment (M3.5). |
 | `uv run dfc train ...` / `dfc distill ...` | Training / teacher distillation (M2/M4).                 |
-| `uv run dfc train-board --preset m1-dev\|mid\|1b [--smoke]` | Train the board-state transformer (M3.5).  |
-| `uv run dfc eval arena --engine-kind board --ckpt ...` | Arena the board engine vs a baseline.        |
+| `uv run dfc train-board --preset m1-dev\|mid\|1b [--n-bias-head N] [--smoke]` | Train the board model; `--n-bias-head` adds 2D-bias heads (M3.5). |
+| `uv run dfc eval arena --engine-kind board\|board-mcts --ckpt ...` | Arena the board engine (or its MCTS/ToT search) vs a baseline. |
 | `uv run dfc web --engine board`            | Play the board engine in the browser; Training tab shows live metrics. |
 | `uv run pytest`                            | Full test suite.                                         |
 | `uv run pytest -q tests/test_protocol_conformance.py` | Just the engine-contract tests.              |

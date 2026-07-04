@@ -100,6 +100,17 @@ by a single preset knob.
 - ✅ 5090 cloud runbook ([docs/training-1b.md](docs/training-1b.md)): VRAM budget,
   hyperparameters, rsync-back-metrics, and why 1B is smoke-verified but not yet
   trained to convergence (corpus ≪ Chinchilla-optimal).
+- ✅ **Data augmentation** (`board_dataset.py`): left–right **mirror** (×2, exact
+  Xiangqi symmetry) + rotate-180 **colour-swap** (×2) → up to ×4; both preserve
+  the mover-relative value. Verified on the real corpus (627,817 → 2,511,268).
+- ✅ **Per-head 2D relative-position bias** (additive extra heads): `--n-bias-head`
+  adds Swin-style zero-init `[Δfile×Δrank]` bias heads on top of the content
+  heads (`n_bias_head=0` is byte-identical to the base); see the plan doc
+  [docs/plans/board-tot-aug-bias.md](docs/plans/board-tot-aug-bias.md).
+- ✅ **Tree-of-Thought search** (`inference/mcts_board.py`): `MctsBoardEngine`,
+  an AlphaZero-style PUCT search using the policy as prior + value/rollout as
+  leaf eval; `dfc eval arena --engine-kind board-mcts`. Strength is gated on the
+  value head, which needs M4 result labels (default `value_mode="rollout"`).
 
 **Exit:** ✅ `dfc data ingest-board` → real shards; `dfc train-board --preset
 m1-dev` trains on MPS (val loss ↓, top1 ↑); the board engine passes conformance
