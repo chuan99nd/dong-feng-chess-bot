@@ -20,8 +20,14 @@
     train_steps: 100000
     train_batch: 256
     gpu_tag: 5090
+    run_id: "board-{{ gpu_tag }}-{{ train_preset }}"
     ckpt_local: "{{ playbook_dir }}/../checkpoints"
     runs_local: "{{ playbook_dir }}/../runs"
+    # HF model store + optional seed. If the run has no ckpt yet and hf_model is
+    # set, its ckpt.pt is pulled from HF so training warm-resumes instead of
+    # starting from scratch. Leave empty to always train fresh.
+    hf_repo: chuannd1999/dong-feng-chess-bot
+    hf_model: ""
 
   tasks:
     - name: Check for a local checkpoint mirror on the Mac
@@ -39,6 +45,37 @@
       when: ckpt_local_stat.stat.exists
       ignore_errors: true
 
+    # ── Ensure a model exists before training: check, else pull from HF ──
+    - name: Check for an existing checkpoint for this run on the server
+      stat:
+        path: "{{ app_dir }}/runs/{{ run_id }}/ckpt.pt"
+      register: server_ckpt
+      become_user: "{{ app_user }}"
+
+    - name: No local ckpt → pull the seed model from Hugging Face
+      when:
+        - not server_ckpt.stat.exists
+        - hf_model | length > 0
+      become_user: "{{ app_user }}"
+      shell: |
+        set -e
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        if [ -f .env ]; then set -a; . ./.env; set +a; fi
+        uv run hf download "{{ hf_repo }}" --include "{{ hf_model }}/*" --local-dir models
+        mkdir -p "runs/{{ run_id }}"
+        cp "models/{{ hf_model }}/ckpt.pt" "runs/{{ run_id }}/ckpt.pt"
+      register: hf_pull
+
+    - name: Report the training seed source
+      debug:
+        msg: >-
+          {{ ('Seeded runs/' ~ run_id ~ '/ckpt.pt from HF model ' ~ hf_model)
+             if (not server_ckpt.stat.exists and hf_model | length > 0)
+             else (('Resuming existing runs/' ~ run_id ~ '/ckpt.pt')
+                   if server_ckpt.stat.exists
+                   else ('No ckpt and no hf_model set → training from scratch')) }}
+
     - name: Update training service with current params
       copy:
         dest: /etc/systemd/system/dongfeng-train.service
@@ -52,7 +89,7 @@
           User={{ app_user }}
           WorkingDirectory={{ app_dir }}
           Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
-          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id board-{{ gpu_tag }}-{{ train_preset }}
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc train-board --data {{ data_remote }} --preset {{ train_preset }} --steps {{ train_steps }} --batch {{ train_batch }} --device cuda --grad-checkpoint --id {{ run_id }}
           Restart=no
           StandardOutput=append:{{ app_dir }}/runs/train.log
           StandardError=append:{{ app_dir }}/runs/train.log
