@@ -1,0 +1,50 @@
+---
+# deploy/nopasswd-sudo.yml — Grant ezycloudx-admin NOPASSWD sudo for JUST the
+# systemctl commands the deploy playbooks need (restart/start/stop the dongfeng
+# services + daemon-reload). Nothing else — no blanket "NOPASSWD: ALL".
+#
+# Run this ONCE (it writes /etc/sudoers.d, which needs root):
+#   cd deploy && ansible-playbook nopasswd-sudo.yml --ask-become-pass
+#
+# Afterwards update.yml restarts services via `sudo systemctl …` matching this
+# rule, so `ansible-playbook update.yml` runs with NO password prompt.
+#
+# The file is validated with visudo before install — a bad rule can never lock
+# out sudo. Everything else (apt, writing /etc, etc. in setup/observability)
+# still requires --ask-become-pass, by design.
+
+- name: Dong Feng — Restricted NOPASSWD sudo for service management
+  hosts: gpu
+  become: true
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+
+  tasks:
+    - name: Install /etc/sudoers.d/dongfeng-systemctl (validated)
+      copy:
+        dest: /etc/sudoers.d/dongfeng-systemctl
+        owner: root
+        group: root
+        mode: "0440"
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          # Managed by deploy/nopasswd-sudo.yml — do not edit by hand.
+          # Lets {{ app_user }} manage only the Dong Feng services without a password.
+          Cmnd_Alias DONGFENG_SYSTEMCTL = \
+            /usr/bin/systemctl daemon-reload, \
+            /usr/bin/systemctl restart dongfeng-web, \
+            /usr/bin/systemctl start dongfeng-web, \
+            /usr/bin/systemctl stop dongfeng-web, \
+            /usr/bin/systemctl restart dongfeng-train, \
+            /usr/bin/systemctl start dongfeng-train, \
+            /usr/bin/systemctl stop dongfeng-train, \
+            /usr/bin/systemctl restart dongfeng-metrics, \
+            /usr/bin/systemctl restart dongfeng-tunnel
+          {{ app_user }} ALL=(root) NOPASSWD: DONGFENG_SYSTEMCTL
+
+    - name: Report
+      debug:
+        msg: >
+          NOPASSWD sudo installed for {{ app_user }} (systemctl on dongfeng-* only).
+          `ansible-playbook update.yml` now runs without --ask-become-pass.

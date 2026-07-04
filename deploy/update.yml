@@ -41,21 +41,21 @@
       environment:
         UV_PYTHON: python3.11
 
-    - name: Restart web UI
-      systemd:
-        name: dongfeng-web
-        state: restarted
-        daemon_reload: true
+    # Restart via `sudo systemctl …` (not the systemd module) so it matches the
+    # restricted NOPASSWD rule from nopasswd-sudo.yml — no password prompt needed.
+    # (become: false — the command calls sudo itself.)
+    - name: Reload systemd + restart services
+      become: false
+      command: "/usr/bin/sudo -n /usr/bin/systemctl {{ item }}"
+      loop:
+        - daemon-reload
+        - restart dongfeng-web
+        - restart dongfeng-train
 
-    - name: Restart training (auto-resumes from ckpt)
-      systemd:
-        name: dongfeng-train
-        state: restarted
-        daemon_reload: true
-
-    - name: Show service status
+    - name: Show service status (is-active needs no root)
+      become: false
       shell: >
-        systemctl is-active dongfeng-web dongfeng-train cloudflared
+        systemctl is-active dongfeng-web dongfeng-train dongfeng-tunnel
       register: svc
       ignore_errors: true
 
