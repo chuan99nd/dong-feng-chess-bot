@@ -1,0 +1,43 @@
+---
+# deploy/backup.yml — Pull the training checkpoints + run logs from the GPU
+# server down to THIS Mac. Run it periodically so an ephemeral machine can be
+# thrown away without losing progress.
+#
+# Usage:
+#   cd deploy && ansible-playbook backup.yml
+#
+# Schedule it every 10 min from the Mac (optional):
+#   crontab -e
+#   */10 * * * * cd /Users/chuan/ghq/github.com/chuan99nd/dong-feng-chess-bot/deploy && \
+#     /opt/homebrew/bin/ansible-playbook backup.yml >> /tmp/dongfeng-backup.log 2>&1
+#
+# On a new machine, setup.yml / start-train.yml push this mirror back up and
+# `dfc train-board` auto-resumes from runs/<id>/ckpt.pt.
+
+- name: Dong Feng — Pull checkpoints to the Mac
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    ckpt_local: "{{ playbook_dir }}/../checkpoints"
+    runs_local: "{{ playbook_dir }}/../runs"
+
+  tasks:
+    - name: Pull checkpoints/ from server → Mac
+      synchronize:
+        mode: pull
+        src: "{{ app_dir }}/checkpoints/"
+        dest: "{{ ckpt_local }}/"
+
+    - name: Pull runs/ (metrics + resumable ckpt.pt) from server → Mac
+      synchronize:
+        mode: pull
+        src: "{{ app_dir }}/runs/"
+        dest: "{{ runs_local }}/"
+
+    - name: Report where the backup landed
+      delegate_to: localhost
+      debug:
+        msg: "Backed up to {{ ckpt_local }} and {{ runs_local }}"

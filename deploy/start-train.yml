@@ -6,8 +6,8 @@
 #   cd deploy && ansible-playbook start-train.yml --ask-become-pass -e train_preset=1b -e train_steps=50000
 #
 # Training auto-resumes: dfc train-board detects an existing runs/<id>/ckpt.pt
-# and continues from its step. On a fresh ephemeral machine, this playbook first
-# pulls the latest checkpoint back from R2 (if R2_* env/vars are set).
+# and continues from its step. On a fresh machine, this playbook first pushes the
+# latest checkpoint mirror from this Mac up to the server (if one exists).
 
 - name: Dong Feng — Start training
   hosts: gpu
@@ -20,17 +20,23 @@
     train_steps: 100000
     train_batch: 256
     gpu_tag: 5090
-    r2_bucket: "{{ lookup('env', 'R2_BUCKET') | default('', true) }}"
-    r2_prefix: dongfeng
+    ckpt_local: "{{ playbook_dir }}/../checkpoints"
+    runs_local: "{{ playbook_dir }}/../runs"
 
   tasks:
-    - name: Restore checkpoints + runs from R2 (so training can resume)
-      shell: |
-        export HOME=/home/{{ app_user }}
-        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints {{ app_dir }}/checkpoints --create-empty-src-dirs
-        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/runs {{ app_dir }}/runs --create-empty-src-dirs
+    - name: Check for a local checkpoint mirror on the Mac
+      delegate_to: localhost
+      become: false
+      stat:
+        path: "{{ ckpt_local }}"
+      register: ckpt_local_stat
+
+    - name: Push local runs up to the server (so training can resume)
+      synchronize:
+        src: "{{ runs_local }}/"
+        dest: "{{ app_dir }}/runs/"
       become_user: "{{ app_user }}"
-      when: r2_bucket | length > 0
+      when: ckpt_local_stat.stat.exists
       ignore_errors: true
 
     - name: Update training service with current params

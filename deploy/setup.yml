@@ -44,16 +44,11 @@
     tunnel_id: "{{ lookup('env', 'TUNNEL_ID') | default('', true) }}"
     cloudflared_cred_local: "{{ lookup('env', 'HOME') }}/.cloudflared/{{ tunnel_id }}.json"
     cloudflared_dir_remote: "/home/{{ app_user }}/.cloudflared"
-    # ── Durable checkpoint backup (Cloudflare R2, S3-compatible) ──
-    # Pass these at runtime (never commit): -e r2_account_id=... etc, or export as env.
-    # When r2_bucket is empty, all backup/restore tasks are skipped.
-    r2_bucket: "{{ lookup('env', 'R2_BUCKET') | default('', true) }}"
-    r2_account_id: "{{ lookup('env', 'R2_ACCOUNT_ID') | default('', true) }}"
-    r2_access_key: "{{ lookup('env', 'R2_ACCESS_KEY_ID') | default('', true) }}"
-    r2_secret_key: "{{ lookup('env', 'R2_SECRET_ACCESS_KEY') | default('', true) }}"
-    r2_prefix: dongfeng
-    backup_every_min: 10
-    rclone_conf_remote: "/home/{{ app_user }}/.config/rclone/rclone.conf"
+    # ── Checkpoint backup lives on THIS Mac (see backup.yml / README) ──
+    # On a fresh machine, setup.yml pushes the local mirror up so training can
+    # resume. These dirs are the git-ignored repo-root checkpoints/ and runs/.
+    ckpt_local: "{{ playbook_dir }}/../checkpoints"
+    runs_local: "{{ playbook_dir }}/../runs"
 
   tasks:
     # ── 1. System packages ──────────────────────────────────────────────
@@ -103,45 +98,31 @@
         - checkpoints
         - runs
 
-    # ── 3b. Durable backup: rclone → Cloudflare R2 + restore ───────────
-    - name: Install rclone (for R2 backup)
-      apt:
-        name: rclone
-        state: present
-      when: r2_bucket | length > 0
+    # ── 3b. Restore prior progress from this Mac (push up) ─────────────
+    - name: Check for a local checkpoint mirror on the Mac
+      delegate_to: localhost
+      become: false
+      stat:
+        path: "{{ ckpt_local }}"
+      register: ckpt_local_stat
 
-    - name: Ensure rclone config dir (locked down)
-      file:
-        path: "/home/{{ app_user }}/.config/rclone"
-        state: directory
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: "0700"
-      when: r2_bucket | length > 0
-
-    - name: Write rclone.conf for R2 (0600, secrets never world-readable)
-      copy:
-        dest: "{{ rclone_conf_remote }}"
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: "0600"
-        content: |
-          [r2]
-          type = s3
-          provider = Cloudflare
-          access_key_id = {{ r2_access_key }}
-          secret_access_key = {{ r2_secret_key }}
-          endpoint = https://{{ r2_account_id }}.r2.cloudflarestorage.com
-          acl = private
-      when: r2_bucket | length > 0
-
-    - name: Restore checkpoints + runs from R2 (resume prior progress)
-      shell: |
-        export HOME=/home/{{ app_user }}
-        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints {{ app_dir }}/checkpoints --create-empty-src-dirs
-        rclone copy r2:{{ r2_bucket }}/{{ r2_prefix }}/runs {{ app_dir }}/runs --create-empty-src-dirs
+    - name: Push local checkpoints up to the server (so training can resume)
+      synchronize:
+        src: "{{ ckpt_local }}/"
+        dest: "{{ app_dir }}/checkpoints/"
+        rsync_opts:
+          - "--progress"
       become_user: "{{ app_user }}"
-      when: r2_bucket | length > 0
+      when: ckpt_local_stat.stat.exists
+
+    - name: Push local runs up to the server (metrics + resumable ckpt.pt)
+      synchronize:
+        src: "{{ runs_local }}/"
+        dest: "{{ app_dir }}/runs/"
+        rsync_opts:
+          - "--progress"
+      become_user: "{{ app_user }}"
+      when: ckpt_local_stat.stat.exists
       ignore_errors: true
 
 
@@ -297,42 +278,6 @@
           WantedBy=multi-user.target
       notify: reload systemd
 
-    # ── 8b. Systemd: durable checkpoint backup (R2) ────────────────────
-    - name: Create checkpoint-sync systemd service (push to R2)
-      copy:
-        dest: /etc/systemd/system/dongfeng-ckpt-sync.service
-        content: |
-          [Unit]
-          Description=Dong Feng checkpoint backup to Cloudflare R2
-          After=network-online.target
-          Wants=network-online.target
-
-          [Service]
-          Type=oneshot
-          User={{ app_user }}
-          Environment=HOME=/home/{{ app_user }}
-          ExecStart=/usr/bin/rclone sync {{ app_dir }}/checkpoints r2:{{ r2_bucket }}/{{ r2_prefix }}/checkpoints --create-empty-src-dirs
-          ExecStartPost=/usr/bin/rclone sync {{ app_dir }}/runs r2:{{ r2_bucket }}/{{ r2_prefix }}/runs --create-empty-src-dirs
-      when: r2_bucket | length > 0
-      notify: reload systemd
-
-    - name: Create checkpoint-sync systemd timer
-      copy:
-        dest: /etc/systemd/system/dongfeng-ckpt-sync.timer
-        content: |
-          [Unit]
-          Description=Periodic Dong Feng checkpoint backup to R2
-
-          [Timer]
-          OnBootSec=5min
-          OnUnitActiveSec={{ backup_every_min }}min
-          Persistent=true
-
-          [Install]
-          WantedBy=timers.target
-      when: r2_bucket | length > 0
-      notify: reload systemd
-
     # ── 9. Cloudflared tunnel service ──────────────────────────────────
     - name: Create cloudflared tunnel systemd service
       copy:
@@ -368,14 +313,6 @@
         name: dongfeng-tunnel
         enabled: true
         state: restarted
-
-    - name: Enable and start checkpoint-sync timer
-      systemd:
-        name: dongfeng-ckpt-sync.timer
-        enabled: true
-        state: started
-        daemon_reload: true
-      when: r2_bucket | length > 0
 
     - name: Show public URL
       debug:

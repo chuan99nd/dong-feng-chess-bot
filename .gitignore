@@ -40,9 +40,6 @@ deploy/secrets/
 cert.pem
 **/.cloudflared/
 deploy/cloudflared/
-# rclone / R2 credentials (never commit)
-rclone.conf
-deploy/rclone.conf
 
 # OS / editor
 .DS_Store

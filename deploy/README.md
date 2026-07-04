@@ -71,31 +71,31 @@ ansible-playbook monitor.yml --ask-become-pass
 | `dongfeng-web`       | Web UI (`dfc web --engine board`)     | 8000 |
 | `dongfeng-train`     | Training run (one-shot, no restart)   | —    |
 | `dongfeng-tunnel`    | Cloudflare Tunnel → web UI            | —    |
-| `dongfeng-ckpt-sync` | Timer: back up checkpoints/runs → R2  | —    |
 
 ## Ephemeral machines — backup & resume
 
 The GPU box is disposable: when it shuts down, its disk is wiped. The tunnel and
 domain survive (they live on Cloudflare), but **training progress does not**
-unless it is backed up off-box. This deploy handles that via **Cloudflare R2**
-(S3-compatible object storage).
+unless it is backed up off-box. Backups are kept **on this Mac** via rsync-over-SSH
+(reuses the same SSH key as the playbooks — no extra credentials).
 
-### One-time R2 setup
+The checkpoint mirror lives in the git-ignored repo-root `checkpoints/` and
+`runs/` folders.
 
-1. In the Cloudflare dashboard: **R2 → Create bucket** (e.g. `dongfeng`).
-2. **R2 → Manage API Tokens → Create** an S3 token with read/write on that bucket.
-3. Export the credentials in the shell you run Ansible from (never commit them):
+### Back up (pull from server → Mac)
 
 ```bash
-export R2_BUCKET=dongfeng
-export R2_ACCOUNT_ID=<cloudflare-account-id>
-export R2_ACCESS_KEY_ID=<token-access-key>
-export R2_SECRET_ACCESS_KEY=<token-secret>
+cd deploy
+ansible-playbook backup.yml
 ```
 
-With these set, `setup.yml` installs rclone, writes a locked-down `rclone.conf`,
-and starts a **timer that syncs `checkpoints/` + `runs/` to R2 every 10 min**.
-If `R2_BUCKET` is empty, all backup tasks are skipped (no-op).
+Schedule it every 10 min so a sudden shutdown loses at most ~10 min of progress:
+
+```bash
+crontab -e
+# */10 * * * * cd /Users/chuan/ghq/github.com/chuan99nd/dong-feng-chess-bot/deploy && \
+#   /opt/homebrew/bin/ansible-playbook backup.yml >> /tmp/dongfeng-backup.log 2>&1
+```
 
 ### When the machine dies → move to a new one
 
@@ -104,14 +104,22 @@ If `R2_BUCKET` is empty, all backup tasks are skipped (no-op).
 #    and copy your SSH key over:
 ssh-copy-id -i ~/.ssh/dongfeng_5090.pub -p <port> ezycloudx-admin@<new-host>
 
-# 2. Re-run setup with the SAME tunnel id and R2 creds exported.
-#    It restores checkpoints/runs from R2 before starting.
+# 2. Re-run setup with the SAME tunnel id. It pushes the local checkpoint
+#    mirror from this Mac up to the new server before starting.
 cd deploy
 ansible-playbook setup.yml --ask-become-pass -e tunnel_id=$TUNNEL_ID
 
-# 3. Resume training (also pulls latest from R2 first).
+# 3. Resume training (also pushes the latest local mirror up first).
 ansible-playbook start-train.yml --ask-become-pass
 ```
+
+`dfc train-board` **auto-resumes**: it detects `runs/<id>/ckpt.pt` and continues
+from its saved step (LR schedule recomputed; optimizer momentum not restored — a
+negligible warm-restart transient). To resume from an explicit file:
+`dfc train-board ... --resume /path/to/ckpt.pt`.
+
+> The same domain `chess.chuantran.site` works on the new machine with no DNS
+> change, because the named tunnel is a Cloudflare resource, not tied to the box.
 
 Training **auto-resumes**: `dfc train-board` detects `runs/<id>/ckpt.pt` and
 continues from its saved step (LR schedule recomputed; optimizer momentum is not
@@ -163,10 +171,6 @@ sudo systemctl restart dongfeng-web
 journalctl -u dongfeng-train -f
 journalctl -u dongfeng-web -f
 journalctl -u dongfeng-tunnel -f
-
-# Backup timer status + last sync
-systemctl status dongfeng-ckpt-sync.timer
-journalctl -u dongfeng-ckpt-sync -n 20
 ```
 
 ## Files
@@ -175,10 +179,11 @@ journalctl -u dongfeng-ckpt-sync -n 20
 - `ansible.cfg` — Ansible settings
 - `setup.yml` — Full server bootstrap (deps, PyTorch cu128, secure tunnel)
 - `start-train.yml` — Start/restart training
+- `backup.yml` — Pull checkpoints/runs from server down to this Mac
 - `monitor.yml` — Health check all services
 
 Secrets that must never be committed (already git-ignored): `inventory.ini`,
-`~/.cloudflared/*.json` credentials, `cert.pem`, `rclone.conf` (R2 keys).
+`~/.cloudflared/*.json` credentials, `cert.pem`.
 
 ## Architecture
 
