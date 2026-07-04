@@ -27,6 +27,8 @@ htmlcov/
 /data/
 /checkpoints/
 /runs/
+# Monitoring state mirror (Prometheus TSDB + Grafana DB) pulled by deploy/backup.yml
+/monitoring/
 
 # Engines / nets (large binaries)
 *.nnue

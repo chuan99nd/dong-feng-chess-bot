@@ -9,6 +9,7 @@ Richer serving (gRPC / batched HTTP inference) is planned for M6.
 
 from __future__ import annotations
 
+from .metrics_exporter import serve_metrics
 from .webplay import serve
 
-__all__ = ["serve"]
+__all__ = ["serve", "serve_metrics"]

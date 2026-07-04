@@ -66,11 +66,45 @@ ansible-playbook monitor.yml --ask-become-pass
 
 ## Services
 
-| Service              | What it does                          | Port |
-|----------------------|---------------------------------------|------|
-| `dongfeng-web`       | Web UI (`dfc web --engine board`)     | 8000 |
-| `dongfeng-train`     | Training run (one-shot, no restart)   | —    |
-| `dongfeng-tunnel`    | Cloudflare Tunnel → web UI            | —    |
+| Service                | What it does                              | Port |
+|------------------------|-------------------------------------------|------|
+| `dongfeng-web`         | Web UI (`dfc web --engine board`)         | 8000 |
+| `dongfeng-train`       | Training run (one-shot, no restart)       | —    |
+| `dongfeng-tunnel`      | Cloudflare Tunnel → web UI + Grafana      | —    |
+| `dongfeng-metrics`     | Training-metrics Prometheus exporter      | 9105 |
+| `node_exporter`        | Host CPU / RAM / disk / net metrics       | 9100 |
+| `nvidia_gpu_exporter`  | GPU util / mem / temp / power             | 9835 |
+| `prometheus`           | Scrapes the exporters (TSDB under app)    | 9090 |
+| `grafana-server`       | Dashboards, served under `/grafana`       | 3000 |
+
+All monitoring ports bind to `127.0.0.1` only. Grafana is reached publicly at
+`https://chess.chuantran.site/grafana` through the same Cloudflare Tunnel
+(behind Cloudflare Access), on a path rule that routes `/grafana*` to port 3000
+while everything else goes to the web UI on 8000.
+
+## Monitoring stack (Prometheus + Grafana)
+
+`setup.yml` imports `observability.yml`, so a single run brings up the full
+stack. Run it standalone to (re)deploy just monitoring:
+
+```bash
+cd deploy
+ansible-playbook observability.yml --ask-become-pass
+# optional: set the Grafana admin password (anonymous Viewer is always on)
+ansible-playbook observability.yml --ask-become-pass -e grafana_admin_password=…
+```
+
+- **Dashboard**: `deploy/monitoring/grafana/dashboards/dongfeng.json` is
+  auto-provisioned (folder "Dong Feng") with training loss/accuracy/LR/throughput,
+  GPU util/mem/temp/power, and host CPU/RAM/disk panels.
+- **Datasource**: Prometheus is auto-provisioned (uid `dongfeng-prom`).
+- **Model exporter**: `dfc metrics-export` reads `runs/*/run.json` +
+  `metrics.jsonl` and exposes `dongfeng_train_*` / `dongfeng_run_*` series.
+- **Anonymous access**: enabled as Viewer, so the dashboard opens without a login
+  (the domain is already gated by Cloudflare Access). Log in as `admin` to edit.
+- **State**: Prometheus TSDB (`monitoring/prometheus-data`) and the Grafana DB
+  (`monitoring/grafana-data`) live under the project dir and are synced to the
+  Mac by `backup.yml` alongside `checkpoints/` and `runs/`.
 
 ## Ephemeral machines — backup & resume
 

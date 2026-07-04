@@ -23,6 +23,7 @@
     app_dir: /home/{{ app_user }}/dong-feng
     ckpt_local: "{{ playbook_dir }}/../checkpoints"
     runs_local: "{{ playbook_dir }}/../runs"
+    monitoring_local: "{{ playbook_dir }}/../monitoring"
 
   tasks:
     - name: Pull checkpoints/ from server → Mac
@@ -37,7 +38,14 @@
         src: "{{ app_dir }}/runs/"
         dest: "{{ runs_local }}/"
 
+    - name: Pull monitoring/ (Prometheus TSDB + Grafana DB) from server → Mac
+      synchronize:
+        mode: pull
+        src: "{{ app_dir }}/monitoring/"
+        dest: "{{ monitoring_local }}/"
+      ignore_errors: true
+
     - name: Report where the backup landed
       delegate_to: localhost
       debug:
-        msg: "Backed up to {{ ckpt_local }} and {{ runs_local }}"
+        msg: "Backed up to {{ ckpt_local }}, {{ runs_local }} and {{ monitoring_local }}"

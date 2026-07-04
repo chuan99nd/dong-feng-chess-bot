@@ -36,6 +36,9 @@
     train_steps: 100000
     train_batch: 256
     gpu_tag: 5090
+    # Grafana is served under /grafana on the same tunnel hostname (see
+    # observability.yml). Kept here so the cloudflared ingress rule can route to it.
+    grafana_port: 3000
     # PyTorch CUDA wheel index. RTX 5090 is Blackwell (sm_120) and needs CUDA 12.8+.
     torch_index_url: https://download.pytorch.org/whl/cu128
     # ── Cloudflare named tunnel (secure) ──
@@ -49,6 +52,7 @@
     # resume. These dirs are the git-ignored repo-root checkpoints/ and runs/.
     ckpt_local: "{{ playbook_dir }}/../checkpoints"
     runs_local: "{{ playbook_dir }}/../runs"
+    monitoring_local: "{{ playbook_dir }}/../monitoring"
 
   tasks:
     # ── 1. System packages ──────────────────────────────────────────────
@@ -96,6 +100,7 @@
         - data
         - checkpoints
         - runs
+        - monitoring
 
     # ── 3b. Restore prior progress from this Mac (push up) ─────────────
     - name: Check for a local checkpoint mirror on the Mac
@@ -118,6 +123,16 @@
       synchronize:
         src: "{{ runs_local }}/"
         dest: "{{ app_dir }}/runs/"
+        rsync_opts:
+          - "--progress"
+      become_user: "{{ app_user }}"
+      when: ckpt_local_stat.stat.exists
+      ignore_errors: true
+
+    - name: Push local monitoring mirror up (Prometheus TSDB + Grafana DB)
+      synchronize:
+        src: "{{ monitoring_local }}/"
+        dest: "{{ app_dir }}/monitoring/"
         rsync_opts:
           - "--progress"
       become_user: "{{ app_user }}"
@@ -229,6 +244,9 @@
           credentials-file: {{ cloudflared_dir_remote }}/{{ tunnel_id }}.json
           ingress:
             - hostname: {{ tunnel_hostname }}
+              path: /grafana.*
+              service: http://127.0.0.1:{{ grafana_port }}
+            - hostname: {{ tunnel_hostname }}
               service: http://127.0.0.1:{{ web_port }}
             - service: http_status:404
 
@@ -324,3 +342,7 @@
     - name: reload systemd
       systemd:
         daemon_reload: true
+
+# ── 11. Observability stack (Prometheus + Grafana + exporters) ─────────
+# Imported so a single `ansible-playbook setup.yml` brings up monitoring too.
+- import_playbook: observability.yml

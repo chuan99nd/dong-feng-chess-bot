@@ -29,12 +29,36 @@
         systemctl is-active dongfeng-train
         echo "=== dongfeng-tunnel ==="
         systemctl is-active dongfeng-tunnel
+        echo "=== dongfeng-metrics ==="
+        systemctl is-active dongfeng-metrics
+        echo "=== node_exporter ==="
+        systemctl is-active node_exporter
+        echo "=== nvidia_gpu_exporter ==="
+        systemctl is-active nvidia_gpu_exporter
+        echo "=== prometheus ==="
+        systemctl is-active prometheus
+        echo "=== grafana-server ==="
+        systemctl is-active grafana-server
       register: svc_status
       ignore_errors: true
 
     - name: Show services
       debug:
         var: svc_status.stdout_lines
+
+    - name: Monitoring endpoint health
+      shell: |
+        echo "prometheus ready:  $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9090/-/ready)"
+        echo "grafana health:    $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/health)"
+        echo "node exporter:     $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9100/metrics)"
+        echo "gpu exporter:      $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9835/metrics)"
+        echo "model exporter:    $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9105/metrics)"
+      register: mon_health
+      ignore_errors: true
+
+    - name: Show monitoring health
+      debug:
+        var: mon_health.stdout_lines
 
     - name: Training log (last 30 lines)
       shell: tail -30 {{ app_dir }}/runs/train.log 2>/dev/null || echo "No training log yet"

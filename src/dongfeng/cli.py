@@ -797,6 +797,17 @@ def web(
     serve(host=host, port=port, engine=engine, checkpoint=ckpt, open_browser=not no_open)
 
 
+@app.command(name="metrics-export")
+def metrics_export(
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind address for the exporter."),
+    port: int = typer.Option(9105, "--port", help="Port to serve /metrics on."),
+) -> None:
+    """Expose training-run metrics for Prometheus at http://host:port/metrics."""
+    from .serve import serve_metrics  # noqa: PLC0415
+
+    serve_metrics(host=host, port=port)
+
+
 def main() -> None:
     """Console-script entry point (see ``[project.scripts]`` ``dfc``)."""
     app()

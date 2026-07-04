@@ -1,0 +1,495 @@
+---
+# deploy/observability.yml — Prometheus + Grafana + node/GPU/model exporters.
+#
+# Brings up the full monitoring stack on the GPU box in one shot. Imported at the
+# end of setup.yml, so a single `ansible-playbook setup.yml` deploys everything;
+# it can also be run standalone:
+#
+#   cd deploy && ansible-playbook observability.yml --ask-become-pass
+#
+# What it installs (all bound to loopback; reached only through the Cloudflare
+# tunnel at https://chess.chuantran.site/grafana):
+#   * node_exporter          :9100  — host CPU / RAM / disk / network
+#   * nvidia_gpu_exporter     :9835  — GPU util / memory / temp / power
+#   * dongfeng-metrics         :9105  — training-run metrics (`dfc metrics-export`)
+#   * prometheus               :9090  — scrapes the three above (data under app_dir)
+#   * grafana                  :3000  — dashboards, served under /grafana sub-path
+#
+# Stateful data (Prometheus TSDB + Grafana DB) lives under
+# {{ app_dir }}/monitoring/ so deploy/backup.yml syncs it to the Mac alongside
+# checkpoints/ and runs/.
+
+- name: Dong Feng — Observability stack
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    monitoring_dir: "{{ app_dir }}/monitoring"
+    prometheus_data: "{{ monitoring_dir }}/prometheus-data"
+    grafana_data: "{{ monitoring_dir }}/grafana-data"
+    tunnel_hostname: chess.chuantran.site
+    grafana_root_path: /grafana
+    web_port: 8000
+
+    # Exporter / server versions (pinned for reproducible installs).
+    node_exporter_version: "1.8.2"
+    prometheus_version: "2.53.2"
+    gpu_exporter_version: "1.2.1"
+
+    # Ports (all loopback-only; Grafana reached via the Cloudflare tunnel).
+    node_exporter_port: 9100
+    gpu_exporter_port: 9835
+    model_exporter_port: 9105
+    prometheus_port: 9090
+    grafana_port: 3000
+
+    # Grafana admin password. Override on the CLI: -e grafana_admin_password=…
+    # The whole app already sits behind Cloudflare Access, and anonymous Viewer
+    # is enabled, so this only guards edit/admin actions.
+    grafana_admin_password: "{{ lookup('env', 'GRAFANA_ADMIN_PASSWORD') | default('dongfeng', true) }}"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart prometheus
+      systemd:
+        name: prometheus
+        state: restarted
+
+    - name: restart grafana
+      systemd:
+        name: grafana-server
+        state: restarted
+
+    - name: restart tunnel
+      systemd:
+        name: dongfeng-tunnel
+        state: restarted
+
+  tasks:
+    # ── 0. Data directories (under app_dir so backup.yml syncs them) ────
+    - name: Create monitoring data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+      loop:
+        - "{{ monitoring_dir }}"
+        - "{{ prometheus_data }}"
+        - "{{ grafana_data }}"
+
+    # ── 1. node_exporter ────────────────────────────────────────────────
+    - name: Check installed node_exporter version
+      command: /usr/local/bin/node_exporter --version
+      register: node_exp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download + install node_exporter
+      when: node_exporter_version not in (node_exp_check.stdout | default('')) + (node_exp_check.stderr | default(''))
+      block:
+        - name: Download node_exporter tarball
+          get_url:
+            url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
+            dest: /tmp/node_exporter.tar.gz
+            mode: "0644"
+
+        - name: Extract node_exporter
+          unarchive:
+            src: /tmp/node_exporter.tar.gz
+            dest: /tmp
+            remote_src: true
+
+        - name: Install node_exporter binary
+          copy:
+            src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+            dest: /usr/local/bin/node_exporter
+            mode: "0755"
+            remote_src: true
+
+    - name: node_exporter systemd unit
+      copy:
+        dest: /etc/systemd/system/node_exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          ExecStart=/usr/local/bin/node_exporter --web.listen-address=127.0.0.1:{{ node_exporter_port }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 2. nvidia_gpu_exporter ─────────────────────────────────────────
+    - name: Check installed nvidia_gpu_exporter version
+      command: /usr/local/bin/nvidia_gpu_exporter --version
+      register: gpu_exp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download + install nvidia_gpu_exporter
+      when: gpu_exporter_version not in (gpu_exp_check.stdout | default('')) + (gpu_exp_check.stderr | default(''))
+      block:
+        - name: Download nvidia_gpu_exporter tarball
+          get_url:
+            url: "https://github.com/utkuozdemir/nvidia_gpu_exporter/releases/download/v{{ gpu_exporter_version }}/nvidia_gpu_exporter_{{ gpu_exporter_version }}_linux_x86_64.tar.gz"
+            dest: /tmp/nvidia_gpu_exporter.tar.gz
+            mode: "0644"
+
+        - name: Extract nvidia_gpu_exporter
+          unarchive:
+            src: /tmp/nvidia_gpu_exporter.tar.gz
+            dest: /tmp
+            remote_src: true
+
+        - name: Install nvidia_gpu_exporter binary
+          copy:
+            src: /tmp/nvidia_gpu_exporter
+            dest: /usr/local/bin/nvidia_gpu_exporter
+            mode: "0755"
+            remote_src: true
+
+    - name: nvidia_gpu_exporter systemd unit
+      copy:
+        dest: /etc/systemd/system/nvidia_gpu_exporter.service
+        content: |
+          [Unit]
+          Description=NVIDIA GPU Exporter (wraps nvidia-smi)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/local/bin/nvidia_gpu_exporter --web.listen-address=127.0.0.1:{{ gpu_exporter_port }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 3. dongfeng model/training exporter ────────────────────────────
+    - name: dongfeng-metrics systemd unit (dfc metrics-export)
+      copy:
+        dest: /etc/systemd/system/dongfeng-metrics.service
+        content: |
+          [Unit]
+          Description=Dong Feng training-metrics exporter (Prometheus)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          Environment=PATH=/home/{{ app_user }}/.local/bin:/usr/local/bin:/usr/bin:/bin
+          Environment=DONGFENG_RUNS_DIR={{ app_dir }}/runs
+          ExecStart=/home/{{ app_user }}/.local/bin/uv run dfc metrics-export --host 127.0.0.1 --port {{ model_exporter_port }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 4. Prometheus ──────────────────────────────────────────────────
+    - name: Check installed prometheus version
+      command: /usr/local/bin/prometheus --version
+      register: prom_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download + install prometheus
+      when: prometheus_version not in (prom_check.stdout | default('')) + (prom_check.stderr | default(''))
+      block:
+        - name: Download prometheus tarball
+          get_url:
+            url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+            dest: /tmp/prometheus.tar.gz
+            mode: "0644"
+
+        - name: Extract prometheus
+          unarchive:
+            src: /tmp/prometheus.tar.gz
+            dest: /tmp
+            remote_src: true
+
+        - name: Install prometheus binaries
+          copy:
+            src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            mode: "0755"
+            remote_src: true
+          loop:
+            - prometheus
+            - promtool
+
+    - name: Create prometheus config directory
+      file:
+        path: /etc/prometheus
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Install prometheus scrape config
+      copy:
+        src: "{{ playbook_dir }}/monitoring/prometheus.yml"
+        dest: /etc/prometheus/prometheus.yml
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      notify: restart prometheus
+
+    - name: Validate prometheus config with promtool
+      command: /usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+      changed_when: false
+
+    - name: prometheus systemd unit
+      copy:
+        dest: /etc/systemd/system/prometheus.service
+        content: |
+          [Unit]
+          Description=Prometheus
+          After=network.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          ExecStart=/usr/local/bin/prometheus \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path={{ prometheus_data }} \
+            --storage.tsdb.retention.time=90d \
+            --web.listen-address=127.0.0.1:{{ prometheus_port }}
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    # ── 5. Grafana ─────────────────────────────────────────────────────
+    - name: Install prerequisites for the Grafana apt repo
+      apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Ensure APT keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Grafana APT signing key
+      get_url:
+        url: https://apt.grafana.com/gpg.key
+        dest: /etc/apt/keyrings/grafana.asc
+        mode: "0644"
+    - name: Add Grafana APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main"
+        filename: grafana
+        state: present
+
+    - name: Install Grafana
+      apt:
+        name: grafana
+        state: present
+        update_cache: true
+
+    - name: Write Grafana config (sub-path serving + data dir under app_dir)
+      copy:
+        dest: /etc/grafana/grafana.ini
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+        content: |
+          # Managed by deploy/observability.yml — do not edit by hand.
+          [paths]
+          data = {{ grafana_data }}
+          logs = {{ grafana_data }}/logs
+          plugins = {{ grafana_data }}/plugins
+          provisioning = /etc/grafana/provisioning
+
+          [server]
+          protocol = http
+          http_addr = 127.0.0.1
+          http_port = {{ grafana_port }}
+          domain = {{ tunnel_hostname }}
+          root_url = https://{{ tunnel_hostname }}{{ grafana_root_path }}/
+          serve_from_sub_path = true
+
+          [security]
+          admin_user = admin
+          admin_password = {{ grafana_admin_password }}
+
+          [users]
+          allow_sign_up = false
+
+          [auth.anonymous]
+          enabled = true
+          org_name = Main Org.
+          org_role = Viewer
+
+          [analytics]
+          reporting_enabled = false
+          check_for_updates = false
+
+          [log]
+          mode = console
+      notify: restart grafana
+
+    - name: Ensure Grafana override dir exists
+      file:
+        path: /etc/systemd/system/grafana-server.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Run Grafana as {{ app_user }} (so backup can read its data dir)
+      copy:
+        dest: /etc/systemd/system/grafana-server.service.d/override.conf
+        content: |
+          [Service]
+          User={{ app_user }}
+          Group={{ app_user }}
+          # Default unit sets ProtectHome=true, which blocks the data dir
+          # under /home; disable it and allow writing to the app dir.
+          ProtectHome=false
+          ReadWritePaths={{ grafana_data }}
+        mode: "0644"
+      notify:
+        - reload systemd
+        - restart grafana
+
+    - name: Remove Grafana's default sample provisioning files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/grafana/provisioning/dashboards/sample.yaml
+        - /etc/grafana/provisioning/datasources/sample.yaml
+      notify: restart grafana
+
+    - name: Make /etc/grafana readable by {{ app_user }} (it runs as that user)
+      file:
+        path: /etc/grafana
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        recurse: true
+
+    - name: Provision Grafana datasource
+      copy:
+        src: "{{ playbook_dir }}/monitoring/grafana/provisioning/datasources/prometheus.yml"
+        dest: /etc/grafana/provisioning/datasources/dongfeng.yml
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+      notify: restart grafana
+
+    - name: Provision Grafana dashboard provider
+      copy:
+        src: "{{ playbook_dir }}/monitoring/grafana/provisioning/dashboards/dashboards.yml"
+        dest: /etc/grafana/provisioning/dashboards/dongfeng.yml
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0640"
+      notify: restart grafana
+
+    - name: Create Grafana dashboards directory
+      file:
+        path: /var/lib/grafana/dashboards
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Install Dong Feng dashboard JSON
+      copy:
+        src: "{{ playbook_dir }}/monitoring/grafana/dashboards/dongfeng.json"
+        dest: /var/lib/grafana/dashboards/dongfeng.json
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0644"
+      notify: restart grafana
+
+    # ── 6. Route /grafana through the existing Cloudflare tunnel ───────
+    - name: Read existing cloudflared config (to reuse the tunnel id)
+      slurp:
+        src: "/home/{{ app_user }}/.cloudflared/config.yml"
+      register: cf_cfg_raw
+
+    - name: Extract tunnel id from existing cloudflared config
+      set_fact:
+        cf_tunnel_id: "{{ cf_cfg_raw.content | b64decode | regex_search('tunnel:\\s*(\\S+)', '\\1') | first }}"
+
+    - name: Rewrite cloudflared ingress (adds /grafana → Grafana, keeps web UI)
+      copy:
+        dest: "/home/{{ app_user }}/.cloudflared/config.yml"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          tunnel: {{ cf_tunnel_id }}
+          credentials-file: /home/{{ app_user }}/.cloudflared/{{ cf_tunnel_id }}.json
+          ingress:
+            - hostname: {{ tunnel_hostname }}
+              path: /grafana.*
+              service: http://127.0.0.1:{{ grafana_port }}
+            - hostname: {{ tunnel_hostname }}
+              service: http://127.0.0.1:{{ web_port }}
+            - service: http_status:404
+      notify: restart tunnel
+
+    # ── 7. Enable + start everything ───────────────────────────────────
+    - name: Enable and (re)start all monitoring services
+      systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: restarted
+        daemon_reload: true
+      loop:
+        - node_exporter
+        - nvidia_gpu_exporter
+        - dongfeng-metrics
+        - prometheus
+        - grafana-server
+
+    - name: Wait for Prometheus to answer
+      uri:
+        url: "http://127.0.0.1:{{ prometheus_port }}/-/ready"
+        status_code: [200]
+      register: prom_ready
+      retries: 10
+      delay: 3
+      until: prom_ready.status == 200
+
+    - name: Wait for Grafana to answer
+      uri:
+        url: "http://127.0.0.1:{{ grafana_port }}/api/health"
+        status_code: [200]
+      register: graf_ready
+      retries: 15
+      delay: 3
+      until: graf_ready.status == 200
+
+    - name: Show monitoring endpoints
+      debug:
+        msg:
+          - "Grafana:    https://{{ tunnel_hostname }}{{ grafana_root_path }}/ (anonymous Viewer; admin/**** to edit)"
+          - "Prometheus: http://127.0.0.1:{{ prometheus_port }} (loopback only)"
+          - "Exporters:  node:{{ node_exporter_port }} gpu:{{ gpu_exporter_port }} model:{{ model_exporter_port }}"
