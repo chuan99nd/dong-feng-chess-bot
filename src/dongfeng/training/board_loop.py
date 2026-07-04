@@ -109,6 +109,16 @@ class BoardTrainConfig:
     seed: int = 0
     grad_checkpoint: bool = False
     eval_every: int = 1_000
+    compile: bool = True
+    """torch.compile the model on CUDA for kernel fusion (T1). Ignored on mps/cpu
+    where compile is flaky/slow. First steps are slow (JIT warmup)."""
+    profile: bool = False
+    """Run the PyTorch profiler over a short window once and write profile.json
+    (per-op FLOPS + device time + measured TFLOP/s) for the UI monitor."""
+    profile_at: int = 25
+    """Step at which to run the profiler window (after compile/JIT warmup)."""
+    profile_steps: int = 8
+    """Number of steps to profile in the window."""
     optim: str = "adamw"
     """Optimizer to use: ``"adamw"`` (default) or ``"adam8bit"``.
 
@@ -184,6 +194,97 @@ def _autocast_ctx(device: str, dtype: torch.dtype) -> Any:
     return torch.autocast(device_type=device_type, dtype=dtype)
 
 
+def _profile_window(
+    model: Any,
+    batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    forward_ctx: Any,
+    value_weight: float,
+    device: str,
+    n_steps: int,
+    out_path: Path,
+) -> None:
+    """Profile a few fwd+bwd steps and write a per-op FLOPS/time breakdown.
+
+    Answers "which op dominates compute / how efficient is it": ``with_flops``
+    tags each aten op (matmuls in attention/FFN, norms, elementwise) with its
+    FLOP count, and we pair that with device time to get an op table plus the
+    achieved TFLOP/s over the window. Run on the *eager* model — FLOP counts are
+    compile-invariant and op attribution is clean. Best-effort: never raises.
+    """
+    from torch.profiler import ProfilerActivity, profile  # noqa: PLC0415
+
+    b_batch, m_batch, v_batch = batch
+    activities = [ProfilerActivity.CPU]
+    if device.startswith("cuda"):
+        activities.append(ProfilerActivity.CUDA)
+
+    def _dev_us(e: Any) -> float:
+        for attr in ("self_device_time_total", "self_cuda_time_total"):
+            v = getattr(e, attr, None)
+            if v:
+                return float(v)
+        return float(getattr(e, "self_cpu_time_total", 0) or 0)
+
+    try:
+        # Warm the exact path once so the window measures steady state.
+        with forward_ctx():
+            p, v = model(b_batch)
+        loss, _, _ = _compute_loss(p, v, m_batch, v_batch, value_weight)
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        with profile(activities=activities, record_shapes=True, with_flops=True) as prof:
+            for _ in range(n_steps):
+                with forward_ctx():
+                    p, v = model(b_batch)
+                loss, _, _ = _compute_loss(p, v, m_batch, v_batch, value_weight)
+                loss.backward()
+                model.zero_grad(set_to_none=True)
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+
+        rows: list[dict[str, Any]] = []
+        total_flops = 0.0
+        total_dev = 0.0
+        for e in prof.key_averages():
+            fl = float(getattr(e, "flops", 0) or 0)
+            dev = _dev_us(e)
+            total_flops += fl
+            total_dev += dev
+            rows.append(
+                {
+                    "name": e.key,
+                    "count": int(e.count),
+                    "device_us": round(dev, 1),
+                    "gflops": round(fl / 1e9, 3),
+                }
+            )
+        for r in rows:
+            r["device_pct"] = round(100 * r["device_us"] / total_dev, 1) if total_dev > 0 else 0.0
+        rows.sort(key=lambda r: r["device_us"], reverse=True)
+
+        summary = {
+            "generated": datetime.now(UTC).isoformat(),
+            "device": device,
+            "n_steps": n_steps,
+            "wall_s": round(wall, 4),
+            "ms_per_step": round(1000 * wall / max(n_steps, 1), 2),
+            "gflops_per_step": round(total_flops / 1e9 / max(n_steps, 1), 1),
+            # FLOPs cover fwd+bwd aten ops that with_flops recognises (mm/bmm/…).
+            "measured_tflops": round(total_flops / wall / 1e12, 2) if wall > 0 else None,
+            "ops": rows[:25],
+        }
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2)
+    except Exception as exc:  # profiling must never break training
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"error": f"{type(exc).__name__}: {exc}"}, fh)
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -235,6 +336,22 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         model = BoardTransformer(model_cfg)
     model.to(device)
     model.train()
+
+    # T1: torch.compile fuses kernels (fewer launches + less VRAM round-trip) —
+    # the main lever on a compute/bandwidth-bound GPU. Only on CUDA (compile is
+    # flaky/slow on mps/cpu). ``model`` stays the eager module (for attribute
+    # access, save, and the profiler — FLOP counts are compile-invariant);
+    # ``train_model`` is what the train/val forward passes call.
+    train_model: Any = model
+    compiled = False
+    if config.compile and device.startswith("cuda"):
+        try:
+            train_model = torch.compile(model)
+            compiled = True
+        except Exception as exc:  # never let compile break a run
+            import warnings  # noqa: PLC0415
+
+            warnings.warn(f"torch.compile failed ({exc}); running eager.", stacklevel=2)
 
     # ------------------------------------------------------------------ data
     boards_np, moves_np, values_np = load_board_arrays(config.data_dir)
@@ -342,6 +459,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         "params": model.num_params(),
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
+        "compiled": compiled,
         "data_dir": str(config.data_dir),
         "started": started_iso,
         "finished": None,
@@ -406,7 +524,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             vv = val_values[s:e].to(device)
 
             with _forward_ctx():
-                p_logits, v_pred = model(vb)
+                p_logits, v_pred = train_model(vb)
 
             total, p_loss, _ = _compute_loss(p_logits, v_pred, vm, vv, config.value_weight)
             batch_n = e - s
@@ -449,7 +567,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
 
             t0 = time.time()
             with _forward_ctx():
-                p_logits, v_pred = model(b_batch)
+                p_logits, v_pred = train_model(b_batch)
 
             total, p_loss, v_loss = _compute_loss(
                 p_logits, v_pred, m_batch, v_batch, config.value_weight
@@ -528,6 +646,19 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                             "arch_hash": model.config.arch_hash(),
                         },
                     )
+
+            # One-shot profiler window (after compile/JIT warmup) → profile.json.
+            if config.profile and step == config.profile_at:
+                _profile_window(
+                    model,
+                    (b_batch, m_batch, v_batch),
+                    _forward_ctx,
+                    config.value_weight,
+                    device,
+                    config.profile_steps,
+                    out_dir / "profile.json",
+                )
+                opt.zero_grad(set_to_none=True)
 
     except Exception:
         _write_run_json("failed", datetime.now(UTC).isoformat())

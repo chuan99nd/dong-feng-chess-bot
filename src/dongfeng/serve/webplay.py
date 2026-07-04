@@ -424,6 +424,18 @@ def _get_run_detail(run_id: str) -> tuple[dict[str, Any], int]:
     return {"run": data, "metrics": metrics}, 200
 
 
+def _read_profile(run_id: str) -> dict[str, Any]:
+    """Return runs/<id>/profile.json (PyTorch profiler op breakdown), or {} if absent."""
+    if not run_id:
+        return {}
+    path = _runs_root() / run_id / "profile.json"
+    try:
+        with open(path) as f:
+            return json.load(f)  # type: ignore[no-any-return]
+    except Exception:
+        return {}
+
+
 def _get_system_info() -> dict[str, Any]:
     """Return GPU stats from nvidia-smi; gracefully returns empty dict if unavailable."""
     info: dict[str, Any] = {}
@@ -504,6 +516,11 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"checkpoints": _list_checkpoints()})
             elif self.path == "/api/system":
                 self._send_json(_get_system_info())
+            elif self.path.startswith("/api/profile"):
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                rid = (qs.get("id") or [""])[0]
+                self._send_json(_read_profile(rid))
             else:
                 self.send_error(404)
 
@@ -714,6 +731,15 @@ _HTML = r"""<!doctype html>
     <div class="card" id="training-gpu-card" style="display:none;">
       <label style="margin-bottom:4px;">GPU</label>
       <div class="gpu-bar" id="training-gpu-bar"></div>
+    </div>
+    <div class="card" id="training-profile-card" style="display:none;">
+      <label style="margin-bottom:4px;">PyTorch Profiler — op breakdown (FLOPS &amp; device time)</label>
+      <div class="chips" id="training-profile-summary"></div>
+      <div style="overflow-x:auto;margin-top:8px;">
+        <table id="training-profile-table" style="width:100%;border-collapse:collapse;font-size:12px;">
+        </table>
+      </div>
+      <div class="muted" id="training-profile-note" style="margin-top:6px;"></div>
     </div>
     <div class="chart-grid" id="training-chart-card" style="display:none;">
       <div class="card">
@@ -1007,11 +1033,50 @@ function selectRun(runId){
   if(_systemPollTimer){ clearInterval(_systemPollTimer); _systemPollTimer=null; }
   _currentRunId = runId;
   if(!runId){
-    ["training-stats-card","training-gpu-card","training-chart-card"].forEach(id=>document.getElementById(id).style.display="none");
+    ["training-stats-card","training-gpu-card","training-chart-card","training-profile-card"].forEach(id=>document.getElementById(id).style.display="none");
     return;
   }
   fetchRunDetail(runId);
   loadSystemInfo();
+}
+
+async function loadProfile(runId){
+  try{
+    const data = await (await fetch("/api/profile?id="+encodeURIComponent(runId))).json();
+    const card = document.getElementById("training-profile-card");
+    if(!data || (!data.ops && !data.error)){ card.style.display="none"; return; }
+    card.style.display="";
+    if(data.error){
+      document.getElementById("training-profile-summary").innerHTML = "";
+      document.getElementById("training-profile-table").innerHTML = "";
+      document.getElementById("training-profile-note").textContent = "Profiler error: "+data.error;
+      return;
+    }
+    const PEAK = 209; // RTX 5090 bf16 dense — same constant as the perf cards
+    const mfu = data.measured_tflops!=null ? (data.measured_tflops/PEAK*100) : null;
+    document.getElementById("training-profile-summary").innerHTML = [
+      ["ms/step", data.ms_per_step!=null?data.ms_per_step+" ms":"—"],
+      ["GFLOP/step", data.gflops_per_step!=null?data.gflops_per_step:"—"],
+      ["measured", data.measured_tflops!=null?data.measured_tflops+" TFLOP/s":"—"],
+      ["MFU", mfu!=null?mfu.toFixed(1)+"%":"—"],
+      ["device", data.device||"—"],
+    ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
+    const rows = (data.ops||[]).slice(0,15);
+    const head = "<tr style='text-align:left;color:#888;border-bottom:1px solid #444;'>"
+      + "<th style='padding:4px 6px;'>op</th><th style='padding:4px 6px;'>device %</th>"
+      + "<th style='padding:4px 6px;'>GFLOPs</th><th style='padding:4px 6px;'>calls</th></tr>";
+    const body = rows.map(r=>{
+      const bar = `<div style="background:#2a4a6a;height:10px;width:${Math.min(100,r.device_pct)}%;border-radius:2px;"></div>`;
+      return `<tr style="border-bottom:1px solid #2a2a2a;">`
+        + `<td style="padding:4px 6px;font-family:ui-monospace,monospace;color:#cfcfcf;">${r.name}</td>`
+        + `<td style="padding:4px 6px;">${r.device_pct}% ${bar}</td>`
+        + `<td style="padding:4px 6px;color:#7fdf9f;">${r.gflops}</td>`
+        + `<td style="padding:4px 6px;color:#999;">${r.count}</td></tr>`;
+    }).join("");
+    document.getElementById("training-profile-table").innerHTML = head + body;
+    document.getElementById("training-profile-note").textContent =
+      "FLOPs = fwd+bwd aten ops (mm/bmm) that torch recognises; flash-attention time shows but its FLOPs aren't counted. Sorted by device time.";
+  }catch(e){ console.error("profile error",e); }
 }
 
 async function fetchRunDetail(runId){
@@ -1020,6 +1085,7 @@ async function fetchRunDetail(runId){
     const data = await resp.json();
     if(data.error){ console.error("run detail error",data.error); return; }
     renderTrainingDetail(data.run, data.metrics||[]);
+    loadProfile(runId);
     if(data.run.status==="running"){
       if(!_trainingPollTimer){
         _trainingPollTimer = setInterval(()=>{
