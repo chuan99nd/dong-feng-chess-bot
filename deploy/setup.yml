@@ -28,7 +28,7 @@
     app_user: ezycloudx-admin
     app_dir: /home/{{ app_user }}/dong-feng
     repo_url: https://github.com/chuan99nd/dong-feng-chess-bot.git
-    repo_branch: feat/board-state-flagship
+    repo_branch: main
     data_local: "{{ playbook_dir }}/../data/vietcotuong-board-aug"
     data_remote: "{{ app_dir }}/data/vietcotuong-board-aug"
     web_port: 8000
@@ -56,14 +56,13 @@
       apt:
         name:
           - git
-          - python3.11
-          - python3.11-venv
-          - python3.11-dev
+          - python3
+          - python3-venv
+          - python3-dev
           - build-essential
           - curl
           - tmux
           - htop
-          - nvtop
         state: present
         update_cache: true
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 import urllib.parse
 import webbrowser
@@ -254,6 +255,30 @@ def _get_run_detail(run_id: str) -> tuple[dict[str, Any], int]:
     return {"run": data, "metrics": metrics}, 200
 
 
+def _get_system_info() -> dict[str, Any]:
+    """Return GPU stats from nvidia-smi; gracefully returns empty dict if unavailable."""
+    info: dict[str, Any] = {}
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        parts = [p.strip() for p in out.split(",")]
+        if len(parts) >= 4:
+            info["gpu_util"] = int(parts[0])
+            info["gpu_mem_used"] = int(parts[1])
+            info["gpu_mem_total"] = int(parts[2])
+            info["gpu_temp"] = int(parts[3])
+    except Exception:
+        pass
+    return info
+
+
 def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - matches base
@@ -295,6 +320,8 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                     self._send_json(resp, status)
                 else:
                     self._send_json({"runs": _list_runs()})
+            elif self.path == "/api/system":
+                self._send_json(_get_system_info())
             else:
                 self.send_error(404)
 
@@ -377,20 +404,25 @@ _HTML = r"""<!doctype html>
   .row { display:flex; gap:8px; }
   .muted { color:#999; font-size:12px; }
   /* Training panel styles */
-  #training-panel { width:100%; max-width:900px; }
-  #training-panel .card { max-width:100%; }
   .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
   .chip { background:#222; border-radius:20px; padding:4px 12px; font-size:12px; color:#ccc; border:1px solid #555; }
   .chip span { color:#fff; font-weight:600; }
-  #training-chart { display:block; width:100%; height:280px; background:#1a1a1a; border-radius:6px; }
   .legend { display:flex; gap:16px; margin-top:6px; font-size:12px; }
   .legend-item { display:flex; align-items:center; gap:6px; }
   .legend-dot { width:14px; height:4px; border-radius:2px; }
-  #training-run-select { margin-bottom:8px; }
   .status-badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
   .status-running { background:#2255aa; color:#adf; }
   .status-done { background:#225533; color:#afd; }
   .status-failed { background:#552222; color:#faa; }
+  .progress-bar-wrap { background:#111; border-radius:6px; height:16px; overflow:hidden; margin-top:10px; }
+  .progress-bar-fill { height:100%; background:linear-gradient(90deg,#1a4a9a,#4da6ff); border-radius:6px; transition:width .6s ease; }
+  .progress-label { font-size:11px; color:#888; margin-top:4px; }
+  .gpu-bar { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; }
+  .gpu-chip { background:#1a2a1a; border:1px solid #3a5a3a; border-radius:20px; padding:4px 12px; font-size:12px; color:#8fbc8f; }
+  .gpu-chip span { color:#afd; font-weight:700; }
+  .charts-row { display:flex; gap:16px; flex-wrap:wrap; width:100%; max-width:960px; }
+  .charts-row .card { flex:1; min-width:260px; }
+  #training-chart, #training-chart2 { display:block; width:100%; height:240px; background:#1a1a1a; border-radius:6px; }
 </style>
 </head>
 <body>
@@ -434,8 +466,8 @@ _HTML = r"""<!doctype html>
     <div class="muted">Bấm quân của bạn rồi bấm ô đích. Chấm xanh = nước hợp lệ.</div>
   </div>
 </div>
-<div id="tab-training" class="tab-content" id="training-panel">
-  <div style="width:100%;max-width:900px;">
+<div id="tab-training" class="tab-content">
+  <div style="width:100%;max-width:960px;">
     <h1>Training Dashboard</h1>
     <div class="card">
       <label>Training run</label>
@@ -444,18 +476,36 @@ _HTML = r"""<!doctype html>
       </select>
     </div>
     <div class="card" id="training-stats-card" style="display:none;">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
         <strong id="training-run-id" style="font-size:15px;"></strong>
         <span id="training-status-badge" class="status-badge"></span>
+        <span id="training-eta" style="font-size:12px;color:#aaa;margin-left:auto;"></span>
       </div>
       <div class="chips" id="training-chips"></div>
+      <div class="progress-bar-wrap" id="training-progress-wrap" style="display:none;">
+        <div class="progress-bar-fill" id="training-progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-label" id="training-progress-label"></div>
     </div>
-    <div class="card" id="training-chart-card" style="display:none;">
-      <label>Loss vs Step</label>
-      <canvas id="training-chart"></canvas>
-      <div class="legend">
-        <div class="legend-item"><div class="legend-dot" style="background:#4da6ff;"></div>Train loss</div>
-        <div class="legend-item"><div class="legend-dot" style="background:#ff7043;"></div>Val loss</div>
+    <div class="card" id="training-gpu-card" style="display:none;">
+      <label style="margin-bottom:4px;">GPU</label>
+      <div class="gpu-bar" id="training-gpu-bar"></div>
+    </div>
+    <div class="charts-row" id="training-chart-card" style="display:none;">
+      <div class="card">
+        <label>Policy Loss</label>
+        <canvas id="training-chart"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#4da6ff;"></div>Train</div>
+          <div class="legend-item"><div class="legend-dot" style="background:#ff7043;"></div>Val</div>
+        </div>
+      </div>
+      <div class="card">
+        <label>Val Top-1 Accuracy</label>
+        <canvas id="training-chart2"></canvas>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:#4caf50;"></div>Accuracy</div>
+        </div>
       </div>
     </div>
   </div>
@@ -587,6 +637,7 @@ refresh();
 
 // ---- Training dashboard ----
 let _trainingPollTimer = null;
+let _systemPollTimer = null;
 let _currentRunId = null;
 
 async function loadTrainingList(){
@@ -594,24 +645,33 @@ async function loadTrainingList(){
     const resp = await fetch("/api/training");
     const data = await resp.json();
     const sel = document.getElementById("training-run-select");
+    const cur = sel.value;
     sel.innerHTML = '<option value="">-- chọn run --</option>';
     for(const run of (data.runs||[])){
       const opt = document.createElement("option");
       opt.value = run.id||"";
       const st = run.status||"";
       const lt = run.last_train;
+      const lv = run.last_val;
       const step = lt ? lt.step : "?";
-      opt.textContent = `${run.id||"?"} [${st}] preset=${run.preset||"?"} step=${step}`;
+      const top1 = lv && lv.top1 != null ? " top1="+Number(lv.top1).toFixed(3) : "";
+      opt.textContent = `${run.id||"?"} [${st}] step=${step}${top1}`;
       sel.appendChild(opt);
     }
+    if(cur){ sel.value = cur; }
   } catch(e){ console.error("training list error",e); }
 }
 
 function selectRun(runId){
   if(_trainingPollTimer){ clearInterval(_trainingPollTimer); _trainingPollTimer=null; }
+  if(_systemPollTimer){ clearInterval(_systemPollTimer); _systemPollTimer=null; }
   _currentRunId = runId;
-  if(!runId){ document.getElementById("training-stats-card").style.display="none"; document.getElementById("training-chart-card").style.display="none"; return; }
+  if(!runId){
+    ["training-stats-card","training-gpu-card","training-chart-card"].forEach(id=>document.getElementById(id).style.display="none");
+    return;
+  }
   fetchRunDetail(runId);
+  loadSystemInfo();
 }
 
 async function fetchRunDetail(runId){
@@ -620,15 +680,39 @@ async function fetchRunDetail(runId){
     const data = await resp.json();
     if(data.error){ console.error("run detail error",data.error); return; }
     renderTrainingDetail(data.run, data.metrics||[]);
-    // Poll every 2s while running
     if(data.run.status==="running"){
       if(!_trainingPollTimer){
-        _trainingPollTimer = setInterval(()=>{ if(_currentRunId===runId) fetchRunDetail(runId); else clearInterval(_trainingPollTimer); }, 2000);
+        _trainingPollTimer = setInterval(()=>{
+          if(_currentRunId===runId){ fetchRunDetail(runId); loadTrainingList(); }
+          else clearInterval(_trainingPollTimer);
+        }, 2000);
       }
+      if(!_systemPollTimer){ _systemPollTimer = setInterval(loadSystemInfo, 5000); }
     } else {
       if(_trainingPollTimer){ clearInterval(_trainingPollTimer); _trainingPollTimer=null; }
+      if(_systemPollTimer){ clearInterval(_systemPollTimer); _systemPollTimer=null; }
     }
   } catch(e){ console.error("fetchRunDetail error",e); }
+}
+
+async function loadSystemInfo(){
+  try {
+    const resp = await fetch("/api/system");
+    const data = await resp.json();
+    const card = document.getElementById("training-gpu-card");
+    const bar  = document.getElementById("training-gpu-bar");
+    if(data.gpu_util != null){
+      card.style.display="";
+      const mem = data.gpu_mem_used != null
+        ? `${data.gpu_mem_used} / ${data.gpu_mem_total} MiB`
+        : "—";
+      bar.innerHTML = [
+        ["Util",  data.gpu_util+"%"],
+        ["Mem",   mem],
+        ["Temp",  data.gpu_temp != null ? data.gpu_temp+"°C" : "—"],
+      ].map(([k,v])=>`<div class="gpu-chip">${k}: <span>${v}</span></div>`).join("");
+    } else { card.style.display="none"; }
+  } catch(e){ /* no gpu */ }
 }
 
 function renderTrainingDetail(run, metrics){
@@ -637,65 +721,118 @@ function renderTrainingDetail(run, metrics){
   document.getElementById("training-run-id").textContent = run.id||"";
   const badge = document.getElementById("training-status-badge");
   const st = run.status||"";
-  badge.textContent = st;
-  badge.className = "status-badge status-"+st;
-  // stat chips
-  const trainMetrics = metrics.filter(m=>m.split==="train");
-  const valMetrics = metrics.filter(m=>m.split==="val");
-  const last = trainMetrics.length ? trainMetrics[trainMetrics.length-1] : null;
-  const lastVal = valMetrics.length ? valMetrics[valMetrics.length-1] : null;
-  const chips = document.getElementById("training-chips");
+  badge.textContent = st; badge.className = "status-badge status-"+st;
+
+  const trainM = metrics.filter(m=>m.split==="train");
+  const valM   = metrics.filter(m=>m.split==="val");
+  const last   = trainM.length ? trainM[trainM.length-1] : null;
+  const lastV  = valM.length   ? valM[valM.length-1]   : null;
   const fmt = (v,d=4)=> v==null?"—":Number(v).toFixed(d);
-  chips.innerHTML = [
-    ["preset", run.preset||"—"],
-    ["params", run.params!=null ? Number(run.params).toLocaleString() : "—"],
-    ["step", last ? last.step : "—"],
-    ["lr", last ? fmt(last.lr,6) : "—"],
-    ["top1", lastVal ? fmt(lastVal.top1,3) : (last ? fmt(last.top1,3) : "—")],
-    ["samples/s", last ? fmt(last.samples_per_s,1) : "—"],
-    ["status", st],
+
+  // ETA
+  const cfg = run.config || {};
+  const maxSteps = cfg.max_steps ? Number(cfg.max_steps) : 0;
+  const curStep  = last ? Number(last.step)+1 : 0;
+  let etaStr = "";
+  if(st==="running" && last && maxSteps && last.elapsed_s && last.step > 0){
+    const etaSec = Math.max(0, (maxSteps-curStep) * last.elapsed_s / curStep);
+    const h = Math.floor(etaSec/3600), m = Math.floor((etaSec%3600)/60);
+    etaStr = `ETA ~${h}h ${m}m`;
+  }
+  document.getElementById("training-eta").textContent = etaStr;
+
+  // Progress bar
+  if(maxSteps > 0){
+    const pct = Math.min(100, curStep/maxSteps*100);
+    document.getElementById("training-progress-wrap").style.display="";
+    document.getElementById("training-progress-fill").style.width = pct.toFixed(1)+"%";
+    document.getElementById("training-progress-label").textContent =
+      `${curStep.toLocaleString()} / ${maxSteps.toLocaleString()} steps (${pct.toFixed(1)}%)`;
+  } else {
+    document.getElementById("training-progress-wrap").style.display="none";
+    document.getElementById("training-progress-label").textContent="";
+  }
+
+  // Chips
+  document.getElementById("training-chips").innerHTML = [
+    ["preset",     run.preset||"—"],
+    ["params",     run.params!=null ? Number(run.params).toLocaleString() : "—"],
+    ["device",     cfg.device||"—"],
+    ["step",       last ? last.step : "—"],
+    ["lr",         last ? fmt(last.lr,6) : "—"],
+    ["policy loss",last ? fmt(last.policy_loss??last.loss) : "—"],
+    ["val loss",   lastV ? fmt(lastV.policy_loss??lastV.loss) : "—"],
+    ["val top1",   lastV ? fmt(lastV.top1,3) : "—"],
+    ["samples/s",  last ? fmt(last.samples_per_s,1) : "—"],
   ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
-  // draw chart
-  drawLossChart(trainMetrics, valMetrics);
+
+  drawLossChart(trainM, valM);
+  drawAccuracyChart(valM);
+}
+
+function _chartCtx(id){
+  const canvas = document.getElementById(id);
+  const dpr = window.devicePixelRatio||1;
+  const W = canvas.offsetWidth||800, H = canvas.offsetHeight||240;
+  canvas.width = W*dpr; canvas.height = H*dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr,dpr); ctx.clearRect(0,0,W,H);
+  return {ctx,W,H};
+}
+
+function _drawGrid(ctx, PAD, W, H, xArr, yArr, yFmt){
+  const cw=W-PAD.l-PAD.r, ch=H-PAD.t-PAD.b;
+  const minX=Math.min(...xArr), maxX=Math.max(...xArr)||1;
+  let minY=Math.min(...yArr), maxY=Math.max(...yArr)||1;
+  if(maxY-minY < 1e-6){ minY-=0.001; maxY+=0.001; }
+  ctx.strokeStyle="#555"; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(PAD.l,PAD.t); ctx.lineTo(PAD.l,PAD.t+ch); ctx.lineTo(PAD.l+cw,PAD.t+ch); ctx.stroke();
+  ctx.fillStyle="#888"; ctx.font="10px system-ui"; ctx.textAlign="right";
+  for(let i=0;i<=4;i++){
+    const v=minY+(maxY-minY)*i/4; const y=PAD.t+(1-i/4)*ch;
+    ctx.fillText(yFmt?yFmt(v):v.toFixed(3), PAD.l-4, y+4);
+    ctx.strokeStyle="#2a2a2a"; ctx.lineWidth=0.5; ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(PAD.l+cw,y); ctx.stroke();
+  }
+  ctx.textAlign="center"; ctx.fillStyle="#888";
+  for(let i=0;i<=4;i++){
+    const s=Math.round(minX+(maxX-minX)*i/4); ctx.fillText(s, PAD.l+cw*i/4, PAD.t+ch+20);
+  }
+  const xp=s=>PAD.l+(maxX===minX?cw/2:(s-minX)/(maxX-minX)*cw);
+  const yp=v=>PAD.t+(1-(v-minY)/(maxY-minY))*ch;
+  return {xp,yp};
 }
 
 function drawLossChart(trainRows, valRows){
-  const canvas = document.getElementById("training-chart");
-  const dpr = window.devicePixelRatio||1;
-  const W = canvas.offsetWidth||800, H = canvas.offsetHeight||280;
-  canvas.width = W*dpr; canvas.height = H*dpr;
-  const ctx = canvas.getContext("2d");
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0,0,W,H);
-  const PAD = {l:50,r:20,t:16,b:36};
-  const cw = W-PAD.l-PAD.r, ch = H-PAD.t-PAD.b;
-  const allRows = [...trainRows,...valRows];
-  if(!allRows.length){ ctx.fillStyle="#666"; ctx.font="14px system-ui"; ctx.fillText("No metrics yet.",PAD.l+20,H/2); return; }
-  const allLoss = allRows.map(r=>r.loss).filter(v=>v!=null&&isFinite(v));
-  const allSteps = allRows.map(r=>r.step).filter(v=>v!=null&&isFinite(v));
-  const minL=Math.min(...allLoss), maxL=Math.max(...allLoss);
-  const minS=Math.min(...allSteps), maxS=Math.max(...allSteps);
-  const lRange = maxL-minL||1, sRange = maxS-minS||1;
-  function xp(s){ return PAD.l + (s-minS)/sRange*cw; }
-  function yp(l){ return PAD.t + (1-(l-minL)/lRange)*ch; }
-  // axes
-  ctx.strokeStyle="#555"; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(PAD.l,PAD.t); ctx.lineTo(PAD.l,PAD.t+ch); ctx.lineTo(PAD.l+cw,PAD.t+ch); ctx.stroke();
-  // y labels
-  ctx.fillStyle="#888"; ctx.font="11px system-ui"; ctx.textAlign="right";
-  for(let i=0;i<=4;i++){ const v=minL+lRange*i/4; const y=yp(v); ctx.fillText(v.toFixed(3),PAD.l-4,y+4); ctx.strokeStyle="#333"; ctx.beginPath(); ctx.moveTo(PAD.l,y); ctx.lineTo(PAD.l+cw,y); ctx.stroke(); }
-  // x labels
-  ctx.textAlign="center"; ctx.fillStyle="#888";
-  for(let i=0;i<=4;i++){ const s=Math.round(minS+sRange*i/4); const x=xp(s); ctx.fillText(s,x,PAD.t+ch+20); }
-  // draw lines
-  function drawLine(rows, color){
-    if(!rows.length) return;
+  const {ctx,W,H} = _chartCtx("training-chart");
+  const PAD={l:52,r:12,t:14,b:34};
+  const all=[...trainRows,...valRows];
+  if(!all.length){ ctx.fillStyle="#666"; ctx.font="13px system-ui"; ctx.textAlign="center"; ctx.fillText("No metrics yet.",W/2,H/2); return; }
+  const getY=r=>r.policy_loss??r.loss;
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,all.map(r=>r.step),all.map(getY).filter(v=>v!=null&&isFinite(v)));
+  const drawLine=(rows,color)=>{
+    const pts=rows.filter(r=>getY(r)!=null&&isFinite(getY(r)));
+    if(!pts.length)return;
     ctx.strokeStyle=color; ctx.lineWidth=2; ctx.beginPath();
-    rows.forEach((r,i)=>{ const x=xp(r.step), y=yp(r.loss); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+    pts.forEach((r,i)=>{ const x=xp(r.step),y=yp(getY(r)); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
     ctx.stroke();
+  };
+  drawLine(trainRows,"#4da6ff"); drawLine(valRows,"#ff7043");
+}
+
+function drawAccuracyChart(valRows){
+  const {ctx,W,H} = _chartCtx("training-chart2");
+  const PAD={l:52,r:12,t:14,b:34};
+  const rows=valRows.filter(r=>r.top1!=null&&isFinite(r.top1));
+  if(!rows.length){ ctx.fillStyle="#666"; ctx.font="13px system-ui"; ctx.textAlign="center"; ctx.fillText("No val metrics yet.",W/2,H/2); return; }
+  const {xp,yp}=_drawGrid(ctx,PAD,W,H,rows.map(r=>r.step),rows.map(r=>r.top1),v=>(v*100).toFixed(1)+"%");
+  ctx.strokeStyle="#4caf50"; ctx.lineWidth=2; ctx.beginPath();
+  rows.forEach((r,i)=>{ const x=xp(r.step),y=yp(r.top1); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  ctx.stroke();
+  if(rows.length){ const lr=rows[rows.length-1];
+    ctx.fillStyle="#4caf50"; ctx.beginPath(); ctx.arc(xp(lr.step),yp(lr.top1),4,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle="#afd"; ctx.font="11px system-ui"; ctx.textAlign="left";
+    ctx.fillText((lr.top1*100).toFixed(1)+"%", xp(lr.step)+8, yp(lr.top1)+4);
   }
-  drawLine(trainRows, "#4da6ff");
-  drawLine(valRows, "#ff7043");
 }
 </script>
 </body>
