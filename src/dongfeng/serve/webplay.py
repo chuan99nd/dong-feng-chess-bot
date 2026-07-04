@@ -36,9 +36,16 @@ from ..core import STARTING_FEN, new_board
 from ..core.types import Color, Move
 from ..protocol.engine import Engine, SearchLimits
 
+_ENGINE_NAMES = ("random", "neural", "board", "board-mcts", "pikafish")
+
 
 def _make_engine(name: str, checkpoint: str | None) -> Engine:
-    """Build an engine by name (``random`` / ``neural`` / ``board``) for the session."""
+    """Build an engine by name for the session.
+
+    Supported: ``random`` / ``neural`` / ``board`` / ``board-mcts`` (board model
+    + PUCT tree search — plays with lookahead) / ``pikafish`` (external UCI
+    engine; needs the binary via ``DONGFENG_PIKAFISH`` or on ``$PATH``).
+    """
     if name == "neural":
         from ..inference.transformer_engine import TransformerEngine  # noqa: PLC0415
 
@@ -50,6 +57,23 @@ def _make_engine(name: str, checkpoint: str | None) -> Engine:
             checkpoint=checkpoint or os.environ.get("DONGFENG_BOARD_CKPT") or None,
             device="auto",
         )
+    if name == "board-mcts":
+        from ..inference.mcts_board import MctsBoardEngine  # noqa: PLC0415
+
+        # Reuse the board checkpoint; value_mode="head" = one forward/sim (fast).
+        return MctsBoardEngine(
+            checkpoint=checkpoint
+            or os.environ.get("DONGFENG_BOARD_MCTS_CKPT")
+            or os.environ.get("DONGFENG_BOARD_CKPT")
+            or None,
+            device="auto",
+            value_mode="head",
+            n_simulations=int(os.environ.get("DONGFENG_MCTS_SIMS", "160")),
+        )
+    if name == "pikafish":
+        from ..engines import PikafishEngine  # noqa: PLC0415
+
+        return PikafishEngine()
     from ..engines import RandomEngine  # noqa: PLC0415
 
     return RandomEngine()
@@ -87,19 +111,29 @@ class GameSession:
         self._checkpoint = checkpoint
         self._lock = threading.Lock()
         self.engine: Engine | None = None
+        self.engine_error: str | None = None
         self.reset(engine_name, "red", 0.0)
 
     def reset(self, engine_name: str, human: str, temperature: float) -> dict[str, Any]:
         with self._lock:
             self.board = new_board(STARTING_FEN)
             self.history: list[Move] = []
-            self.engine_name = (
-                engine_name if engine_name in ("random", "neural", "board") else "random"
-            )
+            self.engine_name = engine_name if engine_name in _ENGINE_NAMES else "random"
             self.human = Color.RED if human == "red" else Color.BLACK
             self.temperature = temperature
-            self.engine = _make_engine(self.engine_name, self._checkpoint)
-            self.engine.new_game()
+            self.engine_error = None
+            # An engine may be unavailable (e.g. pikafish binary missing) — fall
+            # back to random so the UI stays usable and surface the reason.
+            try:
+                self.engine = _make_engine(self.engine_name, self._checkpoint)
+                self.engine.new_game()
+            except Exception as exc:
+                from ..engines import RandomEngine  # noqa: PLC0415
+
+                self.engine_error = f"{self.engine_name} unavailable ({exc}); using random."
+                self.engine_name = "random"
+                self.engine = RandomEngine()
+                self.engine.new_game()
             self._configure_engine()
             self.last_move: list[str] | None = None
             # If the human plays Black, the engine (Red) opens.
@@ -108,8 +142,9 @@ class GameSession:
             return self._state()
 
     def _configure_engine(self) -> None:
-        if self.engine is not None and self.engine_name in ("neural", "board"):
-            self.engine.set_option("Temperature", str(self.temperature))
+        if self.engine is not None and self.engine_name in ("neural", "board", "board-mcts"):
+            with contextlib.suppress(Exception):
+                self.engine.set_option("Temperature", str(self.temperature))
 
     def shutdown_engine(self) -> dict[str, Any]:
         """Unload the inference engine and free device memory (for training).
@@ -129,9 +164,18 @@ class GameSession:
         """(Re)load the inference engine after a shutdown, preserving the game."""
         with self._lock:
             if self.engine is None:
-                self.engine = _make_engine(self.engine_name, self._checkpoint)
-                self.engine.new_game()
-                self._configure_engine()
+                self.engine_error = None
+                try:
+                    self.engine = _make_engine(self.engine_name, self._checkpoint)
+                    self.engine.new_game()
+                    self._configure_engine()
+                except Exception as exc:
+                    from ..engines import RandomEngine  # noqa: PLC0415
+
+                    self.engine_error = f"{self.engine_name} unavailable ({exc}); using random."
+                    self.engine_name = "random"
+                    self.engine = RandomEngine()
+                    self.engine.new_game()
             return self._state()
 
     def reload_engine(self, checkpoint: str | None) -> dict[str, Any]:
@@ -219,6 +263,7 @@ class GameSession:
             "human": self.human.value,
             "engine": self.engine_name,
             "engine_loaded": self.engine is not None,
+            "engine_error": self.engine_error,
             "checkpoint": self._checkpoint,
             "temperature": self.temperature,
             "last_move": self.last_move,
@@ -666,8 +711,10 @@ _HTML = r"""<!doctype html>
     <div class="card">
       <label>Đối thủ (engine)</label>
       <select id="engine">
-        <option value="neural">Neural (model đã train)</option>
         <option value="board">Board transformer</option>
+        <option value="board-mcts">Board + MCTS (tìm kiếm, nhìn xa)</option>
+        <option value="pikafish">Pikafish (engine ngoài, mạnh)</option>
+        <option value="neural">Neural (model đã train)</option>
         <option value="random">Random (baseline)</option>
       </select>
       <label>Bạn cầm quân</label>
@@ -902,7 +949,8 @@ function update(){
     : "Kết thúc";
   setStatus(s);
   const res={ongoing:"",red_win:"🔴 Đỏ thắng!",black_win:"⚫ Đen thắng!",draw:"Hòa"};
-  document.getElementById("result").textContent=res[state.result]||"";
+  document.getElementById("result").textContent=
+    (state.engine_error ? "⚠ "+state.engine_error+"  " : "") + (res[state.result]||"");
   let out=""; state.history.forEach((m,i)=>{ if(i%2===0) out+=(i/2+1)+". "; out+=m+(i%2===0?"  ":"\n"); });
   document.getElementById("moves").textContent=out;
   const et=document.getElementById("engine-toggle");
