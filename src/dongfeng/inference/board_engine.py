@@ -76,6 +76,9 @@ class BoardTransformerEngine(Engine):
         self._top_k = 0  # 0 = no top-k restriction
         self._rng = torch.Generator().manual_seed(0)
         self._checkpoint: str | None = checkpoint
+        # bf16 autocast on CUDA halves inference bandwidth/compute; mps/cpu stay
+        # fp32 (fp16 on MPS risks NaN and the win is small at batch 1).
+        self._amp_dtype = torch.bfloat16 if self._device.startswith("cuda") else None
 
         self._model, self._extra = self._load_model(checkpoint)
 
@@ -140,10 +143,14 @@ class BoardTransformerEngine(Engine):
         torch = self._torch
         ids = self._board_tok.encode(self._board.fen())
         boards = torch.tensor([ids], dtype=torch.long, device=self._device)  # [1, 91]
-        with torch.no_grad():
-            policy_logits, value_t = self._model(boards)
-        # policy_logits: [1, 2554] → [2554]; value_t: [1] → scalar float
-        return policy_logits[0], float(value_t[0].item())
+        with torch.inference_mode():
+            if self._amp_dtype is not None:
+                with torch.autocast(device_type="cuda", dtype=self._amp_dtype):
+                    policy_logits, value_t = self._model(boards)
+            else:
+                policy_logits, value_t = self._model(boards)
+        # policy_logits: [1, 2554] → [2554] fp32 (softmax downstream); value → float
+        return policy_logits[0].float(), float(value_t[0].item())
 
     def _masked_scores(self) -> tuple[list[Move], Any, float]:
         """Return ``(legal_moves, probabilities_over_legal, value_scalar)``.

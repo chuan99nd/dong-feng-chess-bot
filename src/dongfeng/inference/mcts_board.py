@@ -68,6 +68,12 @@ _DEFAULT_C_PUCT = 2.0
 _DEFAULT_N_SIMULATIONS = 200
 _ROLLOUT_MAX_PLIES = 60  # safety cap for the rollout value estimate
 
+# Transposition (evaluation) cache: positions recur heavily across simulations
+# and rollouts, and the model is deterministic per checkpoint, so (legal,
+# priors, value) can be memoised by FEN. Cleared wholesale when full — an LRU
+# would cost more bookkeeping than the forwards it saves at this size.
+_EVAL_CACHE_MAX = 100_000
+
 
 def _local_resolve_device(requested: str) -> str:
     """Minimal device resolver — prefer WP3's version but fall back locally."""
@@ -154,6 +160,17 @@ class MctsBoardEngine(Engine):
         self._checkpoint: str | None = checkpoint
         self._model, self._extra = self._load_model(checkpoint)
 
+        # bf16 autocast on CUDA halves inference bandwidth/compute; mps/cpu stay
+        # fp32 (fp16 on MPS risks NaN and the win is small at batch 1).
+        self._amp_dtype = torch.bfloat16 if self._device.startswith("cuda") else None
+
+        # FEN -> (legal_moves, priors, head_value); valid per checkpoint.
+        self._eval_cache: dict[str, tuple[list[Move], list[float], float]] = {}
+        # Perf counters for the last _run_search (exposed via last_search_stats).
+        self._nn_forwards = 0
+        self._cache_hits = 0
+        self.last_search_stats: dict[str, Any] = {}
+
         self._board = new_board(STARTING_FEN)
 
     # -- Model loading -------------------------------------------------------
@@ -226,6 +243,7 @@ class MctsBoardEngine(Engine):
         elif key == "checkpoint":
             self._model, self._extra = self._load_model(value)
             self._checkpoint = value
+            self._eval_cache.clear()  # cached evals belong to the old weights
 
     def stop(self) -> None:
         """Cooperatively request the running simulation loop to halt."""
@@ -234,30 +252,47 @@ class MctsBoardEngine(Engine):
     # -- Model / policy helpers ----------------------------------------------
 
     def _policy_value(self, board: Any) -> tuple[list[Move], list[float], float]:
-        """Run one forward pass on ``board``.
+        """Evaluate ``board``, memoised by FEN (transposition cache).
 
         Returns ``(legal_moves, priors, head_value)`` where ``priors`` is a list
         aligned with ``legal_moves`` (softmax over legal logits) and
         ``head_value`` is the value-head scalar in (-1, 1) from ``board``'s
         side-to-move perspective. ``legal_moves`` is empty for a terminal node.
         """
+        fen = board.fen()
+        cached = self._eval_cache.get(fen)
+        if cached is not None:
+            self._cache_hits += 1
+            return cached
+
         torch = self._torch
         legal = board.legal_moves()
-        ids = self._board_tok.encode(board.fen())
+        ids = self._board_tok.encode(fen)
         boards = torch.tensor([ids], dtype=torch.long, device=self._device)
-        with torch.no_grad():
-            policy_logits, value_t = self._model(boards)
+        self._nn_forwards += 1
+        with torch.inference_mode():
+            if self._amp_dtype is not None:
+                with torch.autocast(device_type="cuda", dtype=self._amp_dtype):
+                    policy_logits, value_t = self._model(boards)
+            else:
+                policy_logits, value_t = self._model(boards)
         head_value = float(value_t[0].item())
         if not legal:
-            return [], [], head_value
-        legal_ids = torch.tensor(
-            [self._move_tok.encode_move(m) for m in legal],
-            dtype=torch.long,
-            device=self._device,
-        )
-        legal_logits = policy_logits[0][legal_ids]
-        probs = torch.softmax(legal_logits, dim=-1)
-        return legal, [float(x) for x in probs.tolist()], head_value
+            result: tuple[list[Move], list[float], float] = ([], [], head_value)
+        else:
+            legal_ids = torch.tensor(
+                [self._move_tok.encode_move(m) for m in legal],
+                dtype=torch.long,
+                device=self._device,
+            )
+            legal_logits = policy_logits[0].float()[legal_ids]
+            probs = torch.softmax(legal_logits, dim=-1)
+            result = (legal, [float(x) for x in probs.tolist()], head_value)
+
+        if len(self._eval_cache) >= _EVAL_CACHE_MAX:
+            self._eval_cache.clear()
+        self._eval_cache[fen] = result
+        return result
 
     def _rollout_value(self, board: Any) -> float:
         """Play a policy-greedy rollout to a terminal (or cap); return value.
@@ -337,6 +372,9 @@ class MctsBoardEngine(Engine):
     def _run_search(self, limits: SearchLimits) -> tuple[_Node, int]:
         """Build a PUCT tree from the current position. Returns ``(root, sims)``."""
         self._stop_flag = False
+        self._nn_forwards = 0
+        self._cache_hits = 0
+        t0 = time.monotonic()
         root_board = self._board.clone()
         root = _Node(prior=1.0)
         # Prime the root so it has children (and priors) before selection.
@@ -349,16 +387,29 @@ class MctsBoardEngine(Engine):
             deadline = time.monotonic() + limits.movetime_ms / 1000.0
 
         sims = 0
-        if root.is_terminal or not root.children:
-            return root, sims
+        if not (root.is_terminal or not root.children):
+            while sims < n_sims:
+                if self._stop_flag:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                self._simulate(root, root_board)
+                sims += 1
 
-        while sims < n_sims:
-            if self._stop_flag:
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            self._simulate(root, root_board)
-            sims += 1
+        # Search-perf metrics for the last search (sims/s, NN forwards saved by
+        # the transposition cache). Not part of the Engine protocol — read via
+        # engine.last_search_stats by callers that want perf telemetry.
+        dt = max(time.monotonic() - t0, 1e-9)
+        lookups = self._nn_forwards + self._cache_hits
+        self.last_search_stats = {
+            "sims": sims,
+            "time_ms": int(dt * 1000),
+            "sims_per_s": round(sims / dt, 1),
+            "nn_forwards": self._nn_forwards,
+            "cache_hits": self._cache_hits,
+            "cache_hit_rate": round(self._cache_hits / lookups, 4) if lookups else 0.0,
+            "cache_size": len(self._eval_cache),
+        }
         return root, sims
 
     def _simulate(self, root: _Node, root_board: Any) -> None:

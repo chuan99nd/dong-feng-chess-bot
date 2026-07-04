@@ -397,7 +397,15 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     val_moves = moves_t[val_idx_t]
     val_values = values_t[val_idx_t]
 
+    # The gathers above copy; drop the originals so the corpus exists once.
+    del boards_t, moves_t, values_t
+
     n_train = len(train_boards)
+
+    # non_blocking host→device copies are only safe on CUDA (pageable sources are
+    # staged synchronously); on MPS they can race with the source temp being
+    # freed and deliver garbage — so gate on the device.
+    non_blocking = device.startswith("cuda")
 
     def _fetch_batch(
         b_arr: torch.Tensor, m_arr: torch.Tensor, v_arr: torch.Tensor, idx: torch.Tensor
@@ -407,11 +415,11 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         With device-resident data only the tiny index tensor crosses the PCIe bus;
         the gather and the uint8→int64 widening both run on the GPU.
         """
-        idx = idx.to(b_arr.device, non_blocking=True)
+        idx = idx.to(b_arr.device, non_blocking=non_blocking)
         return (
-            b_arr[idx].to(device, non_blocking=True).long(),
-            m_arr[idx].to(device, non_blocking=True).long(),
-            v_arr[idx].to(device, non_blocking=True),
+            b_arr[idx].to(device, non_blocking=non_blocking).long(),
+            m_arr[idx].to(device, non_blocking=non_blocking).long(),
+            v_arr[idx].to(device, non_blocking=non_blocking),
         )
 
     # ------------------------------------------------------------------ optimizer
@@ -481,6 +489,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         "device": device,
         "dtype": str(dtype).replace("torch.", ""),
         "compiled": compiled,
+        "data_on_device": data_on_device,
         "data_dir": str(config.data_dir),
         "started": started_iso,
         "finished": None,
@@ -567,20 +576,26 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     gen = torch.Generator()
     gen.manual_seed(config.seed)
 
+    # Steady-state steps run with zero host↔device syncs: loss/grad-norm stay on
+    # the GPU and are only pulled (.item()) at the logging cadence. The NaN
+    # guard fires at the same cadence — a NaN loss poisons the weights either
+    # way, so catching it ≤log_every steps later loses nothing.
+    log_every = max(1, min(10, config.eval_every // 10))
+    last_log_t = t_start
+    last_log_step = resume_step - 1
+    sps = 0.0
+    tps = 0.0
+
     try:
         for step in range(resume_step, config.max_steps):
             lr = _lr_at(step, config.warmup, config.max_steps, config.lr)
             for pg in opt.param_groups:
                 pg["lr"] = lr
 
-            # Random batch sampling using step-based cycling with shuffle.
             bs = min(config.batch_size, n_train)
             idx = torch.randint(0, n_train, (bs,), generator=gen)
-            b_batch = train_boards[idx].to(device)
-            m_batch = train_moves[idx].to(device)
-            v_batch = train_values[idx].to(device)
+            b_batch, m_batch, v_batch = _fetch_batch(train_boards, train_moves, train_values, idx)
 
-            t0 = time.time()
             with _forward_ctx():
                 p_logits, v_pred = train_model(b_batch)
 
@@ -588,35 +603,45 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                 p_logits, v_pred, m_batch, v_batch, config.value_weight
             )
 
-            # NaN guard (§5 risk)
-            if not torch.isfinite(total):
-                _write_run_json("failed", datetime.now(UTC).isoformat())
-                metrics_fh.close()
-                raise ValueError(f"Loss became {total.item()} at step {step}. Run marked failed.")
-
             opt.zero_grad(set_to_none=True)
             total.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
 
-            elapsed = time.time() - t_start
-            dt = time.time() - t0
-            sps = bs / max(dt, 1e-9)
-            tps = sps * model.config.seq_len
+            do_log = step == 0 or (step + 1) % log_every == 0
+            do_eval = (step + 1) % config.eval_every == 0 or step == config.max_steps - 1
+            is_profile_step = config.profile and step == config.profile_at
+            if not (do_log or do_eval or is_profile_step):
+                continue
 
-            train_loss = total.item()
+            # First host sync since the last log point. Throughput is measured
+            # over the whole window between syncs — per-step wall timing under
+            # async CUDA execution measures kernel-launch time, not step time.
+            train_loss = float(total.item())
+            elapsed = time.time() - t_start
+            window_steps = step - last_log_step
+            sps = window_steps * bs / max(time.time() - last_log_t, 1e-9)
+            tps = sps * model.config.seq_len
+            last_log_t = time.time()
+            last_log_step = step
+
+            # NaN guard (§5 risk)
+            if not math.isfinite(train_loss):
+                _write_run_json("failed", datetime.now(UTC).isoformat())
+                metrics_fh.close()
+                raise ValueError(f"Loss became {train_loss} at step {step}. Run marked failed.")
+
             if step_0_loss is None:
                 step_0_loss = train_loss
 
-            # Log train metrics every 10 steps (or step 0).
-            if step == 0 or (step + 1) % max(1, min(10, config.eval_every // 10)) == 0:
+            if do_log:
                 _log_metrics(
                     {
                         "step": step,
                         "split": "train",
                         "loss": train_loss,
                         "policy_loss": p_loss.item(),
-                        "value_loss": v_loss.item() if v_loss is not None else None,
+                        "value_loss": v_loss.item() if corpus_has_values else None,
                         "top1": None,
                         "lr": lr,
                         "grad_norm": float(grad_norm),
@@ -627,7 +652,6 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
                 )
 
             # Validate + maybe save.
-            do_eval = (step + 1) % config.eval_every == 0 or step == config.max_steps - 1
             if do_eval:
                 val_loss, val_policy_loss, val_top1, val_top5 = _run_val()
                 val_elapsed = time.time() - t_start
