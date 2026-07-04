@@ -1,0 +1,112 @@
+---
+# deploy/push-model.yml — Upload a trained checkpoint to the Hugging Face Hub.
+#
+# Models live on the HF Hub, NOT in git (the repo stays code-only). This pulls
+# runs/<run_id>/ckpt.pt (+ run.json) from the GPU server down to the Mac, then
+# uploads it to the HF model repo under <model_name>/ via the `hf` CLI.
+# Fail-loud: model save is critical, so any failure aborts and prints the error.
+#
+# Usage:
+#   cd deploy && ansible-playbook push-model.yml -e run_id=board-5090-mid
+#   ...                          -e run_id=board-5090-mid -e model_name=prod
+#   ...                          -e hf_repo=chuan99nd/dong-feng   # override repo
+#
+# Auth: HF_TOKEN in <repo>/.env (gitignored). No sudo needed — runs on the Mac.
+
+- name: Dong Feng — Push a trained model to Hugging Face
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    repo_root: "{{ playbook_dir | dirname }}"
+    model_name: "{{ run_id | default('') }}"
+    dest_dir: "{{ repo_root }}/models/{{ model_name }}"
+    # HF model repo (namespace/name). Override with -e hf_repo=… (extra-vars win).
+    hf_repo: chuannd1999/dong-feng-chess-bot
+
+  tasks:
+    - name: Require run_id
+      delegate_to: localhost
+      assert:
+        that:
+          - run_id is defined
+          - run_id | length > 0
+        fail_msg: "Pass -e run_id=<run> (a runs/<run>/ckpt.pt on the server)."
+
+    - name: Ensure the model dir exists locally
+      delegate_to: localhost
+      file:
+        path: "{{ dest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Pull runs/<run_id>/ckpt.pt + run.json from server → Mac
+      synchronize:
+        mode: pull
+        src: "{{ app_dir }}/runs/{{ run_id }}/"
+        dest: "{{ dest_dir }}/"
+        rsync_opts:
+          - "--include=ckpt.pt"
+          - "--include=run.json"
+          - "--exclude=*"
+
+    - name: Assert the checkpoint is present
+      delegate_to: localhost
+      stat:
+        path: "{{ dest_dir }}/ckpt.pt"
+      register: ckpt_stat
+      failed_when: not ckpt_stat.stat.exists
+
+    - name: Require HF_TOKEN in .env (model save is critical — fail loud)
+      delegate_to: localhost
+      vars:
+        env_tok: "{{ (lookup('ansible.builtin.file', repo_root ~ '/.env', errors='ignore') | default('')) | regex_search('(?m)^\\s*HF_TOKEN\\s*=\\s*(\\S+)', '\\1') }}"
+      assert:
+        that:
+          - env_tok | length > 0
+          - env_tok[0] | length > 20
+        fail_msg: >-
+          No HF_TOKEN in {{ repo_root }}/.env (add `HF_TOKEN=hf_...`). The
+          checkpoint is on the Mac at {{ dest_dir }} but was NOT uploaded to HF.
+      no_log: true
+
+    - name: Upload the model to Hugging Face (token from .env, never in argv)
+      delegate_to: localhost
+      # Pure shell so `. .env` loads HF_TOKEN into the env; the hf CLI reads
+      # $HF_TOKEN from the environment — the token is never in argv or a fact.
+      shell: |
+        set -a
+        . "{{ repo_root }}/.env"
+        set +a
+        uv run hf repo create "{{ hf_repo }}" --repo-type model -y 2>/dev/null || true
+        uv run hf upload "{{ hf_repo }}" "{{ dest_dir }}" "{{ model_name }}" \
+          --repo-type model \
+          --commit-message "push {{ model_name }} (run {{ run_id }})"
+      args:
+        chdir: "{{ repo_root }}"
+      register: hf_res
+      changed_when: hf_res.rc == 0
+      failed_when: false
+      no_log: true  # keeps HF_TOKEN out of logs; the next task surfaces errors
+
+    - name: Abort loudly if the upload failed (model NOT on HF)
+      delegate_to: localhost
+      when: hf_res.rc != 0
+      fail:
+        msg: |
+          UPLOAD TO HUGGING FACE FAILED — the checkpoint is on the Mac at
+          {{ dest_dir }} but is NOT on the Hub. Fix and retry.
+          exit code: {{ hf_res.rc }}
+          --- stderr ---
+          {{ hf_res.stderr | default('(none)') }}
+          --- stdout ---
+          {{ hf_res.stdout | default('(none)') }}
+
+    - name: Report success
+      delegate_to: localhost
+      debug:
+        msg: >-
+          Uploaded {{ model_name }} (run {{ run_id }}) to
+          https://huggingface.co/{{ hf_repo }}/tree/main/{{ model_name }}

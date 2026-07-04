@@ -39,6 +39,9 @@ mcp = [
 model = [
     "torch>=2.2",
     "numpy>=1.26",
+    # Model artifacts live on the Hugging Face Hub (not git). Provides the `hf`
+    # CLI (upload/download) used by deploy/push-model.yml and pull-model.yml.
+    "huggingface_hub>=0.34",
 ]
 
 [project.scripts]

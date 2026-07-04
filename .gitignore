@@ -32,6 +32,8 @@ htmlcov/
 /data/
 /checkpoints/
 /runs/
+# Models live on the Hugging Face Hub (deploy/push-model.yml), not git.
+/models/
 # Monitoring state mirror (Prometheus TSDB + Grafana DB) pulled by deploy/backup.yml
 /monitoring/
 

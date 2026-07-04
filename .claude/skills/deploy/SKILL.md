@@ -21,7 +21,8 @@ playbooks that touch systemd/apt need it.
 | `setup.yml` | First-time bootstrap on a **new/replacement** GPU box: installs deps, uv, PyTorch cu128, clones the repo, pushes local `checkpoints/`+`runs/`+`monitoring/` mirrors up, installs the secure Cloudflare tunnel, creates all systemd services, then imports `observability.yml`. | Yes |
 | `update.yml` | You changed Python/web code only (no new deps) and want it live fast — **`git push` first**, then the server pulls `main`, `uv sync`, restarts `dongfeng-web` + `dongfeng-train`. Code goes via GitHub (no rsync — avoids server-tree conflicts). Training auto-resumes separately. | No, once `nopasswd-sudo.yml` has been run (else Yes) |
 | `nopasswd-sudo.yml` | One-time: grant `ezycloudx-admin` restricted NOPASSWD sudo for **just** the `systemctl` commands the deploy needs (restart/start/stop dongfeng-* + daemon-reload), validated with visudo. After this, `update.yml` runs with no password prompt. | Yes (writes /etc/sudoers.d — the one time you still need it) |
-| `commit-model.yml` | Version a trained checkpoint into GitHub: pulls `runs/<run_id>/ckpt.pt` from the server, tracks `models/**/*.pt` with **Git LFS**, commits + pushes as `models/<model_name>/ckpt.pt`. Run with `-e run_id=<run>`. | No |
+| `push-model.yml` | Upload a trained checkpoint to the **Hugging Face Hub** (models live on HF, not git): pulls `runs/<run_id>/ckpt.pt` from the server, then `hf upload`s it to `<model_name>/` in the HF repo. Run with `-e run_id=<run>`. Auth = `HF_TOKEN` in `.env`. Fail-loud. | No |
+| `pull-model.yml` | Download a model from HF onto the GPU server (`hf download` into `models/<model_name>/`) so the web/train services can load it. Run with `-e model_name=<name>` (run `update.yml` first so `hf` is installed). | No |
 | `start-train.yml` | Start or restart training with specific params (`train_preset`, `train_steps`, `train_batch`). Pushes local `runs/` mirror up first so it can resume from `ckpt.pt`. | Yes |
 | `observability.yml` | (Deploy) or redeploy just the monitoring stack: Prometheus, Grafana, node/GPU/model exporters. Already imported by `setup.yml`; run standalone to update dashboards/exporter config without touching training/web. | Yes |
 | `monitor.yml` | Health check — GPU status + `systemctl is-active` for every service (web, train, tunnel, metrics, exporters, prometheus, grafana). Read-only, safe to run anytime. | Yes (reads systemd/nvidia-smi as root) |
@@ -43,8 +44,10 @@ ansible-playbook nopasswd-sudo.yml --ask-become-pass
 git push origin main
 ansible-playbook update.yml          # no --ask-become-pass once nopasswd-sudo.yml has run
 
-# Version a trained checkpoint into GitHub via Git LFS (models/<run_id>/ckpt.pt)
-ansible-playbook commit-model.yml -e run_id=wp-aug-bias-300
+# Upload a trained checkpoint to the Hugging Face Hub (models live on HF, not git)
+ansible-playbook push-model.yml -e run_id=board-5090-mid
+# Download a model from HF onto the GPU server (after update.yml has installed hf)
+ansible-playbook pull-model.yml -e model_name=board-5090-mid
 
 # Deploy/update just the monitoring stack (Prometheus + Grafana + exporters)
 ansible-playbook observability.yml --ask-become-pass

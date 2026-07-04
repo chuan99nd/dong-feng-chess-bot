@@ -1,0 +1,52 @@
+---
+# deploy/pull-model.yml — Download a model from Hugging Face onto the GPU server.
+#
+# Models live on the HF Hub (see push-model.yml), not git. This fetches
+# <model_name>/ from the HF repo into the server's models/ dir, so the web/train
+# services can load models/<model_name>/ckpt.pt. This is how the RTX box gets
+# its weights.
+#
+# Usage:
+#   cd deploy && ansible-playbook pull-model.yml -e model_name=board-5090-mid
+#   ...                          -e model_name=board-5090-mid -e hf_repo=other/repo
+#
+# Deps: needs `hf` on the server — run update.yml first (it `uv sync`s the
+# `model` extra, which includes huggingface_hub). No sudo needed.
+# Auth: public repo needs no token; a private repo reads HF_TOKEN from
+# {{ app_dir }}/.env if present.
+
+- name: Dong Feng — Pull a model from Hugging Face onto the server
+  hosts: gpu
+  become: false
+  gather_facts: false
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    hf_repo: chuannd1999/dong-feng-chess-bot
+
+  tasks:
+    - name: Require model_name
+      delegate_to: localhost
+      assert:
+        that:
+          - model_name is defined
+          - model_name | length > 0
+        fail_msg: "Pass -e model_name=<name> (a folder in the HF repo, e.g. board-5090-mid)."
+
+    - name: Download <model_name>/ from HF into models/ on the server
+      shell: |
+        set -e
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        if [ -f .env ]; then set -a; . ./.env; set +a; fi
+        uv run hf download "{{ hf_repo }}" --include "{{ model_name }}/*" \
+          --repo-type model --local-dir models
+      register: dl
+      changed_when: dl.rc == 0
+      failed_when: dl.rc != 0
+
+    - name: Report
+      debug:
+        msg: >-
+          Downloaded {{ model_name }} to {{ app_dir }}/models/{{ model_name }}/ckpt.pt
+          (point DONGFENG_BOARD_CKPT there, or hot-reload it from the web UI).
