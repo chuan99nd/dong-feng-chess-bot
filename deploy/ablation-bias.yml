@@ -1,0 +1,108 @@
+---
+# deploy/ablation-bias.yml — 2D-bias-head ablation on the GPU box (WP-BIAS).
+#
+# Holds the MODEL SIZE fixed (one preset) and varies ONLY --n-bias-head, so any
+# change in val loss / top1 is attributable to the architectural addition, not to
+# parameter count differences at the preset level. Runs the A/B/C matrix
+# sequentially (they share the GPU), each writing its own runs/<id>/ so the web
+# Training tab and `dfc eval head-diversity` can compare them.
+#
+# Usage:
+#   cd deploy
+#   ansible-playbook ablation-bias.yml --ask-become-pass
+#   ansible-playbook ablation-bias.yml --ask-become-pass \
+#       -e ablation_preset=mid -e ablation_steps=4000 -e 'bias_heads=[0,4]'
+#
+# After it finishes, pull results down and read the diagnostics locally:
+#   ansible-playbook backup.yml
+#   for k in 0 2 4; do
+#     uv run dfc eval head-diversity \
+#       --ckpt runs/ablation-bias$k/ckpt.pt --data data/vietcotuong-board-aug;
+#   done
+
+- name: Dong Feng — 2D-bias-head ablation (fixed model size)
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    data_remote: "{{ app_dir }}/data/vietcotuong-board-aug"
+    # Fixed across all runs — this is what "same compute / same size" means here.
+    ablation_preset: m1-dev
+    ablation_steps: 2000
+    ablation_batch: 256
+    ablation_lr: 0.0003
+    ablation_seed: 0
+    # The only thing that varies. Override with -e 'bias_heads=[0,4]'.
+    bias_heads: [0, 2, 4]
+    uv_bin: /home/{{ app_user }}/.local/bin/uv
+
+  tasks:
+    - name: Ensure the augmented board dataset is present on the server
+      stat:
+        path: "{{ data_remote }}/board_meta.json"
+      register: data_stat
+
+    - name: Fail if the dataset is missing
+      assert:
+        that: data_stat.stat.exists
+        fail_msg: >-
+          {{ data_remote }} not found. Run setup.yml (or rsync the shards up)
+          before the ablation.
+
+    # Run each arm sequentially; --id encodes the bias-head count so runs don't
+    # collide and auto-resume works if the box restarts mid-ablation.
+    - name: "Train ablation arm — n_bias_head={{ item }}"
+      become_user: "{{ app_user }}"
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        {{ uv_bin }} run dfc train-board \
+          --data {{ data_remote }} \
+          --id ablation-bias{{ item }} \
+          --preset {{ ablation_preset }} \
+          --n-bias-head {{ item }} \
+          --steps {{ ablation_steps }} \
+          --batch {{ ablation_batch }} \
+          --lr {{ ablation_lr }} \
+          --seed {{ ablation_seed }} \
+          --device cuda \
+          --eval-every 200 \
+          2>&1 | tail -20
+      loop: "{{ bias_heads }}"
+      register: arm_results
+
+    - name: Show each arm's tail output
+      debug:
+        var: item.stdout_lines
+      loop: "{{ arm_results.results }}"
+      loop_control:
+        label: "n_bias_head={{ item.item }}"
+
+    # Diagnostics per arm: head redundancy + geometry usage (WP-BIAS evidence).
+    - name: "Head-diversity diagnostics — n_bias_head={{ item }}"
+      become_user: "{{ app_user }}"
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        {{ uv_bin }} run dfc eval head-diversity \
+          --ckpt runs/ablation-bias{{ item }}/ckpt.pt \
+          --data {{ data_remote }} \
+          --batch 256 --device cuda --seed {{ ablation_seed }}
+      loop: "{{ bias_heads }}"
+      register: diag_results
+
+    - name: Show diagnostics per arm
+      debug:
+        var: item.stdout_lines
+      loop: "{{ diag_results.results }}"
+      loop_control:
+        label: "n_bias_head={{ item.item }}"
+
+    - name: How to read the results
+      debug:
+        msg:
+          - "Compare final val loss/top1 in the web Training tab (one run per arm),"
+          - "and the diagnostics above: lower head_sim + larger rel_bias norms on"
+          - "the >0 arms mean the extra heads earned their (small) parameter cost."
+          - "Pull everything down with: ansible-playbook backup.yml"

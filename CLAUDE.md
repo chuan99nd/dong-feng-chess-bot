@@ -53,6 +53,7 @@ Everything runs through `uv`. There is no `pip install`; use `uv sync`.
 | `uv run dfc train ...` / `dfc distill ...` | Training / teacher distillation (M2/M4).                 |
 | `uv run dfc train-board --preset m1-dev\|mid\|1b [--n-bias-head N] [--smoke]` | Train the board model; `--n-bias-head` adds 2D-bias heads (M3.5). |
 | `uv run dfc eval arena --engine-kind board\|board-mcts --ckpt ...` | Arena the board engine (or its MCTS/ToT search) vs a baseline. |
+| `uv run dfc eval head-diversity --ckpt ... --data ...` | Measure 2D-bias-head effectiveness: per-layer head redundancy + `rel_bias` usage (WP-BIAS ablation). |
 | `uv run dfc web --engine board`            | Play the board engine in the browser; Training tab shows live metrics. |
 | `uv run pytest`                            | Full test suite.                                         |
 | `uv run pytest -q tests/test_protocol_conformance.py` | Just the engine-contract tests.              |

@@ -783,6 +783,49 @@ def eval_arena(
     )
 
 
+@eval_app.command("head-diversity")
+def eval_head_diversity(
+    ckpt: str = typer.Option(..., "--ckpt", help="Board checkpoint path (ckpt.pt)."),
+    data: str = typer.Option(..., "--data", help="Board shard dir (board-ds-v1)."),
+    batch: int = typer.Option(256, "--batch", help="Number of positions to probe."),
+    device: str = typer.Option("cpu", "--device"),
+    seed: int = typer.Option(0, "--seed"),
+) -> None:
+    """Measure whether the 2D-bias heads add non-redundant capacity (WP-BIAS).
+
+    Loads a trained board checkpoint plus a batch of positions and reports, per
+    layer, the mean pairwise cosine similarity between heads' attention maps
+    (lower = more specialised) and each bias head's ``rel_bias`` norm (0 = the
+    geometry prior went unused). Use it to judge an n_bias_head ablation that
+    holds the model size fixed.
+    """
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from .data import load_board_arrays  # noqa: PLC0415
+    from .model import BoardTransformer, format_report, head_diversity  # noqa: PLC0415
+
+    model, _extra = BoardTransformer.load(ckpt, map_location=device)
+    model.to(device)
+
+    boards, _moves, _values = load_board_arrays(data)
+    if boards.shape[0] == 0:
+        raise typer.BadParameter(f"no positions found in {data!r}")
+    rng = np.random.default_rng(seed)
+    n = min(batch, boards.shape[0])
+    idx = rng.choice(boards.shape[0], size=n, replace=False)
+    batch_np = np.asarray(boards[idx], dtype=np.int64)
+    boards_t = torch.from_numpy(batch_np).to(device)
+
+    diags = head_diversity(model, boards_t)
+    cfg = model.config
+    _console.print(
+        f"checkpoint: {ckpt}  preset d_model={cfg.d_model} n_layer={cfg.n_layer} "
+        f"n_head={cfg.n_head} n_bias_head={cfg.n_bias_head}  ({n} positions)"
+    )
+    _console.print(format_report(diags))
+
+
 @app.command()
 def web(
     engine: str = typer.Option("neural", "--engine", help="random | neural."),
