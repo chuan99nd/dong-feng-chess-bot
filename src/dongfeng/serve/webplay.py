@@ -7,6 +7,8 @@ The browser renders the board (SVG) and posts moves to a tiny JSON API:
 * ``GET  /api/state``           -> current game state (fen, legal moves, turn, result)
 * ``POST /api/new``             -> reset the game (engine, human color, temperature)
 * ``POST /api/move``            -> apply a human move, then the engine's reply
+* ``POST /api/engine/shutdown`` -> unload the inference model (free memory for training)
+* ``POST /api/engine/start``    -> reload the inference model after a shutdown
 * ``GET  /api/training``        -> list all training runs (newest first)
 * ``GET  /api/training?id=X``   -> detail for run X with downsampled metrics
 
@@ -17,6 +19,7 @@ The engine runs server-side, so the neural :class:`~dongfeng.inference.transform
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -50,12 +53,38 @@ def _make_engine(name: str, checkpoint: str | None) -> Engine:
     return RandomEngine()
 
 
+def _free_torch_memory() -> None:
+    """Best-effort release of cached GPU/MPS memory after dropping an engine.
+
+    Frees the inference allocator's cache so a concurrent training process can
+    reclaim device memory. No-op when torch (or a GPU backend) is absent.
+    """
+    try:
+        import gc  # noqa: PLC0415
+
+        import torch  # noqa: PLC0415
+    except Exception:
+        return
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 class GameSession:
     """A single in-memory game: board + history + engine (human vs engine)."""
 
     def __init__(self, engine_name: str, checkpoint: str | None) -> None:
         self._checkpoint = checkpoint
         self._lock = threading.Lock()
+        self.engine: Engine | None = None
         self.reset(engine_name, "red", 0.0)
 
     def reset(self, engine_name: str, human: str, temperature: float) -> dict[str, Any]:
@@ -77,10 +106,35 @@ class GameSession:
             return self._state()
 
     def _configure_engine(self) -> None:
-        if self.engine_name in ("neural", "board"):
+        if self.engine is not None and self.engine_name in ("neural", "board"):
             self.engine.set_option("Temperature", str(self.temperature))
 
+    def shutdown_engine(self) -> dict[str, Any]:
+        """Unload the inference engine and free device memory (for training).
+
+        The game state is preserved; moves are refused until the engine is
+        started again via :meth:`start_engine`.
+        """
+        with self._lock:
+            if self.engine is not None:
+                with contextlib.suppress(Exception):
+                    self.engine.stop()
+                self.engine = None
+                _free_torch_memory()
+            return self._state()
+
+    def start_engine(self) -> dict[str, Any]:
+        """(Re)load the inference engine after a shutdown, preserving the game."""
+        with self._lock:
+            if self.engine is None:
+                self.engine = _make_engine(self.engine_name, self._checkpoint)
+                self.engine.new_game()
+                self._configure_engine()
+            return self._state()
+
     def _engine_reply(self) -> str | None:
+        if self.engine is None:
+            return None
         if self.board.is_game_over():
             return None
         self.engine.set_position(STARTING_FEN, list(self.history))
@@ -92,6 +146,8 @@ class GameSession:
 
     def human_move(self, frm: str, to: str) -> dict[str, Any]:
         with self._lock:
+            if self.engine is None:
+                return {"error": "engine is shut down", "state": self._state()}
             if self.board.turn is not self.human:
                 return {"error": "not your turn", "state": self._state()}
             try:
@@ -133,6 +189,7 @@ class GameSession:
             "in_check": self.board.is_check(),
             "human": self.human.value,
             "engine": self.engine_name,
+            "engine_loaded": self.engine is not None,
             "temperature": self.temperature,
             "last_move": self.last_move,
         }
@@ -397,6 +454,10 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 self._send_json(session.human_move(str(data.get("from")), str(data.get("to"))))
             elif self.path == "/api/undo":
                 self._send_json(session.undo())
+            elif self.path == "/api/engine/shutdown":
+                self._send_json(session.shutdown_engine())
+            elif self.path == "/api/engine/start":
+                self._send_json(session.start_engine())
             else:
                 self.send_error(404)
 
@@ -527,6 +588,9 @@ _HTML = r"""<!doctype html>
       <div class="row" style="margin-top:10px;">
         <button id="new">Ván mới</button>
         <button id="undo" class="secondary">Đi lại</button>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="engine-toggle" class="secondary">Tắt engine (nhường RAM cho training)</button>
       </div>
     </div>
     <div class="card">
@@ -732,12 +796,21 @@ function update(){
   document.getElementById("result").textContent=res[state.result]||"";
   let out=""; state.history.forEach((m,i)=>{ if(i%2===0) out+=(i/2+1)+". "; out+=m+(i%2===0?"  ":"\n"); });
   document.getElementById("moves").textContent=out;
+  const et=document.getElementById("engine-toggle");
+  if(state.engine_loaded===false){ et.textContent="Bật engine"; et.classList.add("active"); }
+  else { et.textContent="Tắt engine (nhường RAM cho training)"; et.classList.remove("active"); }
 }
 async function undo(){ if(busy||!state) return; busy=true; sel=null; setStatus("Đang đi lại…");
   state=await(await fetch("/api/undo",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
   busy=false; render(); update(); }
+async function toggleEngine(){ if(busy||!state) return; busy=true;
+  const path=state.engine_loaded===false?"/api/engine/start":"/api/engine/shutdown";
+  setStatus(state.engine_loaded===false?"Đang bật engine…":"Đang tắt engine…");
+  state=await(await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})).json();
+  busy=false; render(); update(); }
 document.getElementById("new").addEventListener("click",newGame);
 document.getElementById("undo").addEventListener("click",undo);
+document.getElementById("engine-toggle").addEventListener("click",toggleEngine);
 document.getElementById("temp").addEventListener("input",e=>document.getElementById("tval").textContent=e.target.value);
 refresh();
 

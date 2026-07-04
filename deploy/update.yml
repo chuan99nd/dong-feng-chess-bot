@@ -1,0 +1,57 @@
+---
+# deploy/update.yml — Pull latest code + restart services (fast, no dep reinstall).
+#
+# Usage:
+#   cd deploy && ansible-playbook update.yml --ask-become-pass
+#
+# Use this when you've only changed Python/web code (e.g. the training monitor or
+# model architecture) and want it live without re-running the full setup.yml
+# (which also reinstalls PyTorch/deps). Training auto-resumes from runs/<id>/ckpt.pt.
+
+- name: Dong Feng — Update code + restart
+  hosts: gpu
+  become: true
+  vars:
+    app_user: ezycloudx-admin
+    app_dir: /home/{{ app_user }}/dong-feng
+    repo_branch: main
+
+  tasks:
+    - name: Pull latest code
+      git:
+        repo: https://github.com/chuan99nd/dong-feng-chess-bot.git
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: true
+      become_user: "{{ app_user }}"
+
+    - name: Sync Python deps (fast if unchanged)
+      shell: |
+        export PATH="/home/{{ app_user }}/.local/bin:$PATH"
+        cd {{ app_dir }}
+        uv sync --extra model --extra dev
+      become_user: "{{ app_user }}"
+      environment:
+        UV_PYTHON: python3.11
+
+    - name: Restart web UI
+      systemd:
+        name: dongfeng-web
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart training (auto-resumes from ckpt)
+      systemd:
+        name: dongfeng-train
+        state: restarted
+        daemon_reload: true
+
+    - name: Show service status
+      shell: >
+        systemctl is-active dongfeng-web dongfeng-train cloudflared
+      register: svc
+      ignore_errors: true
+
+    - name: Display status
+      debug:
+        var: svc.stdout_lines
