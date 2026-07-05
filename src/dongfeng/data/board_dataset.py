@@ -415,3 +415,27 @@ def load_board_arrays(
     moves = np.concatenate(moves_parts, axis=0)
     values = np.concatenate(values_parts, axis=0)
     return boards, moves, values
+
+
+def load_eval_arrays(data_dir: str | Path) -> np.ndarray | None:
+    """Load Pikafish value labels (``values_eval_<stem>.bin``) if present.
+
+    Returns a float32 array aligned 1:1 with :func:`load_board_arrays`' samples
+    (NaN = masked / no score), or ``None`` if the eval shards don't exist for
+    every board shard (i.e. the dataset hasn't been labelled — see
+    ``dfc data label-eval``). Non-breaking: callers treat ``None`` as "no dense
+    value target".
+    """
+    data_dir = Path(data_dir)
+    with open(data_dir / "board_meta.json", encoding="utf-8") as fh:
+        meta = json.load(fh)
+    shard_names: list[str] = meta.get("shards", [])
+    if not shard_names:
+        return None
+    parts: list[np.ndarray] = []
+    for stem in shard_names:
+        path = data_dir / f"values_eval_{stem}.bin"
+        if not path.is_file():
+            return None  # partial/absent labels → treat the whole dataset as unlabelled
+        parts.append(np.memmap(path, dtype=np.float32, mode="r"))
+    return np.concatenate(parts, axis=0)

@@ -602,6 +602,9 @@ def train_board(
     device: str = typer.Option("auto", "--device", help="auto | cpu | mps | cuda"),
     seed: int = typer.Option(0, "--seed"),
     value_weight: float = typer.Option(0.5, "--value-weight"),
+    value_eval_weight: float = typer.Option(
+        0.7, "--value-eval-weight", help="Blend: target = w·pikafish_eval + (1-w)·terminal."
+    ),
     grad_checkpoint: bool = typer.Option(False, "--grad-checkpoint/--no-grad-checkpoint"),
     eval_every: int = typer.Option(1_000, "--eval-every"),
     compile: bool = typer.Option(
@@ -737,6 +740,7 @@ def train_board(
         warmup=warmup,
         max_steps=max_steps,
         value_weight=value_weight,
+        value_eval_weight=value_eval_weight,
         device=device,
         seed=seed,
         grad_checkpoint=grad_checkpoint,

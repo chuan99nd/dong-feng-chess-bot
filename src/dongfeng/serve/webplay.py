@@ -1278,6 +1278,7 @@ function renderTrainingDetail(run, metrics){
     ["batch",      cfg.batch_size||"—"],
     ["optim",      cfg.optim||"—"],
     ["compiled",   run.compiled===true ? "yes" : (run.compiled===false ? "no" : "—")],
+    ["eval labels",run.has_eval_labels===true ? "pikafish" : (run.has_eval_labels===false ? "terminal only" : "—")],
     ["code",       run.git_commit ? ((run.git_branch||"?")+"@"+run.git_commit) : "—"],
   ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
 

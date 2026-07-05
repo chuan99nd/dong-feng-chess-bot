@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..data.board_dataset import load_board_arrays
+from ..data.board_dataset import load_board_arrays, load_eval_arrays
 from ..model.board_transformer import BoardTransformer, BoardTransformerConfig
 
 # ---------------------------------------------------------------------------
@@ -105,6 +105,9 @@ class BoardTrainConfig:
     warmup: int = 1_000
     max_steps: int = 100_000
     value_weight: float = 0.5
+    value_eval_weight: float = 0.7
+    """Blend weight on the dense Pikafish eval label vs the terminal outcome when
+    ``values_eval_*.bin`` are present: ``target = w·eval + (1−w)·terminal``."""
     device: str = "auto"
     seed: int = 0
     grad_checkpoint: bool = False
@@ -183,24 +186,40 @@ def _compute_loss(
     move_targets: torch.Tensor,
     value_targets: torch.Tensor,
     value_weight: float,
+    value_eval: torch.Tensor | None = None,
+    eval_alpha: float = 0.7,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute combined loss (§1.7) with no host↔device sync.
 
-    The value MSE is computed branchlessly over the samples whose target is not
-    the 127 mask sentinel: masked samples contribute exactly 0 to the loss and
-    its gradient, and an all-masked batch yields ``value_loss == 0`` (previously
-    ``None``). The data-dependent ``if mask.any()`` branch is gone — it forced a
-    GPU→CPU sync every step and blocked torch.compile/CUDA-graph capture.
+    The value MSE is over the samples with a target: the terminal outcome
+    (``!= 127``) and/or a dense Pikafish eval label (``value_eval``, NaN=absent).
+    When both are present the target is ``eval_alpha·eval + (1−eval_alpha)·term``
+    (Phase 4b distillation blend); when only one is present that one is used;
+    when neither, the sample is masked out (0 contribution, no gradient). The
+    masking is branchless so torch.compile / CUDA-graph capture is preserved.
 
     The value term is computed in fp32: under autocast (fp16 on MPS, bf16 on
-    CUDA) ``value_pred`` is low-precision, and casting up keeps the MSE stable
-    (MPS also rejects the mixed-dtype subtract otherwise).
+    CUDA) ``value_pred`` is low-precision, and casting up keeps the MSE stable.
     """
     # Policy CE over full 2554 vocab — no masking at train time.
     policy_loss = F.cross_entropy(policy_logits, move_targets)
 
-    mask = value_targets != _MASK_VALUE  # bool tensor [B]
-    diff = value_pred.float() - value_targets.float()  # targets: −1 / 0 / +1 / 127
+    has_term = value_targets != _MASK_VALUE  # bool [B]
+    term = torch.where(has_term, value_targets.float(), torch.zeros_like(value_targets).float())
+    if value_eval is None:
+        target = term
+        mask = has_term
+    else:
+        has_eval = ~torch.isnan(value_eval)
+        ev = torch.nan_to_num(value_eval.float())  # 0 where NaN (masked out below)
+        both = has_eval & has_term
+        # both → blend; eval-only → eval; term-only → term.
+        target = torch.where(
+            both, eval_alpha * ev + (1.0 - eval_alpha) * term, torch.where(has_eval, ev, term)
+        )
+        mask = has_eval | has_term
+
+    diff = value_pred.float() - target
     value_loss = (diff.pow(2) * mask).sum() / mask.sum().clamp(min=1)
     total = policy_loss + value_weight * value_loss
 
@@ -400,6 +419,12 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     moves_t = torch.from_numpy(moves_np.astype(np.int32))  # [N] int32
     values_t = torch.from_numpy(np.ascontiguousarray(values_np))  # [N] int8
 
+    # Optional dense Pikafish value labels (Phase 4b). Aligned 1:1 with boards;
+    # None when the dataset hasn't been labelled (dfc data label-eval).
+    eval_np = load_eval_arrays(config.data_dir)
+    has_eval = eval_np is not None
+    eval_t = torch.from_numpy(np.ascontiguousarray(eval_np)) if eval_np is not None else None
+
     # T2: keep the whole corpus resident on the training device when it fits —
     # this removes the per-step CPU gather + synchronous H2D copy from the hot
     # loop entirely (2.5M samples ≈ 240 MB in compact dtypes).
@@ -417,6 +442,8 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         boards_t = boards_t.to(device)
         moves_t = moves_t.to(device)
         values_t = values_t.to(device)
+        if eval_t is not None:
+            eval_t = eval_t.to(device)
 
     # corpus_has_values: computed once so per-step logging never has to inspect
     # the mask (the loss itself is branchless — see _compute_loss).
@@ -433,8 +460,12 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
     val_moves = moves_t[val_idx_t]
     val_values = values_t[val_idx_t]
 
+    train_eval = eval_t[train_idx_t] if eval_t is not None else None
+    val_eval = eval_t[val_idx_t] if eval_t is not None else None
+
     # The gathers above copy; drop the originals so the corpus exists once.
     del boards_t, moves_t, values_t
+    del eval_t
 
     n_train = len(train_boards)
 
@@ -528,6 +559,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         "compiled": compiled,
         **_git_info(),
         "data_on_device": data_on_device,
+        "has_eval_labels": has_eval,
         "data_dir": str(config.data_dir),
         "started": started_iso,
         "finished": None,
@@ -594,11 +626,14 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             vb = val_boards[s:e].to(device).long()
             vm = val_moves[s:e].to(device).long()
             vv = val_values[s:e].to(device)
+            ve = val_eval[s:e].to(device) if val_eval is not None else None
 
             with _forward_ctx():
                 p_logits, v_pred = train_model(vb)
 
-            total, p_loss, _ = _compute_loss(p_logits, v_pred, vm, vv, config.value_weight)
+            total, p_loss, _ = _compute_loss(
+                p_logits, v_pred, vm, vv, config.value_weight, ve, config.value_eval_weight
+            )
             batch_n = e - s
             total_loss_acc += total.item() * batch_n
             total_policy_acc += p_loss.item() * batch_n
@@ -663,6 +698,10 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             bs = min(config.batch_size, n_train)
             idx = torch.randint(0, n_train, (bs,), generator=gen)
             b_batch, m_batch, v_batch = _fetch_batch(train_boards, train_moves, train_values, idx)
+            e_batch = None
+            if train_eval is not None:
+                ei = idx.to(train_eval.device, non_blocking=non_blocking)
+                e_batch = train_eval[ei].to(device, non_blocking=non_blocking)
 
             with _forward_ctx():
                 p_logits, v_pred = train_model(b_batch)
@@ -673,7 +712,9 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             vw_ramp = config.value_weight * min(
                 1.0, (step + 1) / max(1, int(0.1 * config.max_steps))
             )
-            total, p_loss, v_loss = _compute_loss(p_logits, v_pred, m_batch, v_batch, vw_ramp)
+            total, p_loss, v_loss = _compute_loss(
+                p_logits, v_pred, m_batch, v_batch, vw_ramp, e_batch, config.value_eval_weight
+            )
 
             opt.zero_grad(set_to_none=True)
             total.backward()
