@@ -441,6 +441,8 @@ def data_label_eval(
     engine_path: str = typer.Option(
         "", "--engine", help="Pikafish binary (else $DONGFENG_PIKAFISH/PATH)."
     ),
+    threads: int = typer.Option(1, "--threads", help="Pikafish threads/search (use idle CPUs)."),
+    hash_mb: int = typer.Option(256, "--hash-mb", help="Pikafish hash size (MB)."),
 ) -> None:
     """Label positions with Pikafish value/state scores (Phase 4 distillation).
 
@@ -458,6 +460,8 @@ def data_label_eval(
     )
 
     engine = PikafishEngine(engine_path or None)
+    engine.set_option("Threads", str(threads))
+    engine.set_option("Hash", str(hash_mb))
     try:
         engine.new_game()
     except EngineNotAvailableError as exc:
