@@ -368,6 +368,7 @@ def _list_models() -> list[dict[str, Any]]:
                     f"d{arch.get('d_model')}·L{arch.get('n_layer')}·"
                     f"h{arch.get('n_head')}"
                     + (f"+{arch.get('n_bias_head')}b" if arch.get("n_bias_head") else "")
+                    + (f"+{arch.get('n_think')}t" if arch.get("n_think") else "")
                 )
                 if arch
                 else None,

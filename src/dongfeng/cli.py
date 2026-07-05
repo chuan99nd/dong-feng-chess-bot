@@ -561,6 +561,16 @@ def train_board(
     ),
     profile_at: int = typer.Option(25, "--profile-at", help="Step to run the profiler window at."),
     profile_steps: int = typer.Option(8, "--profile-steps", help="Steps to profile."),
+    n_think: int = typer.Option(
+        0,
+        "--n-think",
+        help="Latent [THINK]/pause tokens (0=off) — thinking room; needs retrain or --init-from.",
+    ),
+    init_from: str = typer.Option(
+        "",
+        "--init-from",
+        help="Warm-start from another ckpt.pt (shape-matching copy; e.g. to add --n-think).",
+    ),
     optim: str = typer.Option(
         "adamw",
         "--optim",
@@ -646,10 +656,10 @@ def train_board(
         f"preset={preset!r} steps={max_steps} device={resolved_device}"
     )
     override = None
-    if n_bias_head:
+    if n_bias_head or n_think:
         _presets = BoardTransformerConfig.presets()
         if preset in _presets:
-            override = replace(_presets[preset], n_bias_head=n_bias_head)
+            override = replace(_presets[preset], n_bias_head=n_bias_head, n_think=n_think)
 
     # Resume: use the explicit path if given, otherwise auto-resume from an
     # existing ckpt.pt in the run dir (so a restarted systemd/ephemeral run
@@ -682,6 +692,7 @@ def train_board(
         profile_steps=profile_steps,
         optim=optim,
         resume=resume_path,
+        init_from=init_from or None,
         config_override=override,
     )
     ckpt = bc_train_board(cfg)

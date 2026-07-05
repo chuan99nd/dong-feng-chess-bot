@@ -135,6 +135,15 @@ class BoardTrainConfig:
     ephemeral machines. Optimizer momentum is not restored (the LR schedule is
     recomputed from the resumed step).
     """
+    init_from: str | Path | None = None
+    """Optional ckpt.pt to warm-start from (shape-matching weight copy).
+
+    Unlike ``resume`` (which continues the SAME architecture from its step), this
+    grafts a different checkpoint's weights into a freshly-built model — used to
+    enable ``--n-think`` on top of a pre-think checkpoint. Only applied on a
+    fresh run (``resume`` takes precedence); think_emb + grown bias columns stay
+    at their zero init.
+    """
     config_override: BoardTransformerConfig | None = field(default=None, repr=False)
 
 
@@ -343,6 +352,16 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
         resume_best_val = float(resume_extra.get("val_policy_loss", float("inf")))
     else:
         model = BoardTransformer(model_cfg)
+        # Warm-start: graft a pre-think checkpoint's weights into the fresh model
+        # (e.g. enabling --n-think). think_emb + grown bias cols stay zero-init.
+        if config.init_from and Path(config.init_from).exists():
+            res = model.warm_start_from(config.init_from, map_location="cpu")
+            print(
+                f"warm-start from {config.init_from}: "
+                f"copied {len(res['copied'])}, kept-init {len(res['skipped'])} "
+                f"({', '.join(res['skipped']) or 'none'})",
+                flush=True,
+            )
     model.to(device)
     model.train()
 
@@ -497,6 +516,7 @@ def bc_train_board(config: BoardTrainConfig) -> Path:
             "n_layer": arch_cfg.n_layer,
             "n_head": arch_cfg.n_head,
             "n_bias_head": arch_cfg.n_bias_head,
+            "n_think": arch_cfg.n_think,
             "ffn_hidden": arch_cfg.ffn_hidden,
             "seq_len": arch_cfg.seq_len,
             "vocab_size": arch_cfg.vocab_size,

@@ -54,6 +54,7 @@ class BoardTransformerConfig:
     n_layer: int = 12
     n_head: int = 6
     n_bias_head: int = 0  # extra attention heads carrying a learnable 2D rel-pos bias
+    n_think: int = 0  # latent [THINK]/pause tokens appended after the 91 (0 = off)
     ffn_hidden: int = 1024
     vocab_size: int = 21  # board-v1 token vocabulary
     seq_len: int = 91  # 90 board squares + 1 side-to-move token
@@ -88,6 +89,10 @@ class BoardTransformerConfig:
             "seq_len": self.seq_len,
             "n_moves": self.n_moves,
         }
+        # Only perturb the hash when think tokens are on, so n_think=0 stays
+        # byte-identical (and weight-compatible) with pre-think checkpoints.
+        if self.n_think:
+            arch["n_think"] = self.n_think
         payload = json.dumps(arch, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
@@ -102,19 +107,26 @@ _REL_N_FILE = 17  # Δfile + 8 ∈ 0..16
 _REL_N_RANK = 19  # Δrank + 9 ∈ 0..18
 _REL_TABLE_SIZE = _REL_N_FILE * _REL_N_RANK + 1  # 17*19 + 1 = 324
 _REL_SIDE_BUCKET = _REL_TABLE_SIZE - 1  # 323 — any pair involving the side token
+_REL_THINK_BUCKET = _REL_TABLE_SIZE  # 324 — any pair touching a [THINK] token (n_think>0 only)
 
 
-def _build_rel_index(seq_len: int = 91) -> torch.Tensor:
-    """Build the ``[seq_len, seq_len]`` long bias-bucket index for board squares.
+def _rel_table_size(n_think: int) -> int:
+    """Bias-table size: 324 normally, +1 think bucket when think tokens are on."""
+    return _REL_TABLE_SIZE + (1 if n_think > 0 else 0)
 
-    For a board–board pair (query ``i``, key ``j`` both < 90) the bucket is
-    ``(Δfile + 8) * 19 + (Δrank + 9)`` where ``Δfile = file_i - file_j`` and
-    ``Δrank = rank_i - rank_j``. Board coords from seq index: ``file = i % 9`` and
-    ``iccs_rank = 9 - i // 9``. Any pair touching the side token (index 90) maps
-    to bucket ``323``.
+
+def _build_rel_index(seq_len: int = 91, n_think: int = 0) -> torch.Tensor:
+    """Build the ``[seq_len, seq_len]`` long bias-bucket index.
+
+    Board–board pairs (both < 90) map to ``(Δfile+8)*19 + (Δrank+9)`` (file=i%9,
+    iccs_rank=9−i//9). Pairs touching the side token (index 90) → bucket 323.
+    When ``n_think>0`` the extra tokens are at indices 91..90+n_think; any pair
+    touching a think token → bucket 324 (checked first, so think<->side also
+    lands in the think bucket).
     """
     idx = torch.arange(seq_len)
-    is_side = idx >= 90  # index 90 is the side-to-move token
+    is_side = idx == 90  # index 90 is the side-to-move token
+    is_think = idx >= 91  # indices 91.. are [THINK] tokens (empty when n_think=0)
     file = idx % 9  # only meaningful for board squares (< 90)
     rank = 9 - idx // 9  # iccs rank
     dfile = file[:, None] - file[None, :]  # [T, T]
@@ -122,6 +134,9 @@ def _build_rel_index(seq_len: int = 91) -> torch.Tensor:
     bucket = (dfile + 8) * _REL_N_RANK + (drank + 9)
     touches_side = is_side[:, None] | is_side[None, :]
     bucket = torch.where(touches_side, torch.full_like(bucket, _REL_SIDE_BUCKET), bucket)
+    if n_think > 0:
+        touches_think = is_think[:, None] | is_think[None, :]
+        bucket = torch.where(touches_think, torch.full_like(bucket, _REL_THINK_BUCKET), bucket)
     return bucket.long()
 
 
@@ -183,9 +198,17 @@ class _BidirectionalAttention(nn.Module):
 
         if self.n_bias_head > 0:
             # Per-layer, zero-init learnable bias table for the extra heads.
-            self.rel_bias = nn.Parameter(torch.zeros(self.n_bias_head, _REL_TABLE_SIZE))
+            # Table gains a think bucket only when n_think>0 (keeps n_think=0
+            # weight-compatible with pre-think bias checkpoints at size 324).
+            self.rel_bias = nn.Parameter(
+                torch.zeros(self.n_bias_head, _rel_table_size(cfg.n_think))
+            )
             # Shared, non-persistent index buffer (follows device moves).
-            self.register_buffer("rel_index", _build_rel_index(cfg.seq_len), persistent=False)
+            self.register_buffer(
+                "rel_index",
+                _build_rel_index(cfg.seq_len + cfg.n_think, cfg.n_think),
+                persistent=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
@@ -260,6 +283,14 @@ class BoardTransformer(nn.Module):
         self.rank_emb = nn.Embedding(10, d)
         self.side_emb = nn.Parameter(torch.zeros(d))  # single learned vector for idx 90
 
+        # Latent [THINK]/pause tokens: n_think learned vectors appended after the
+        # 91 board+side tokens. Registered ONLY when n_think>0 so an n_think=0
+        # model has no think_emb key — byte-identical to and load-compatible with
+        # pre-think checkpoints. Zero-init; each slot is positionally unique by
+        # construction (like side_emb), so no extra positional lookup.
+        if config.n_think > 0:
+            self.think_emb = nn.Parameter(torch.zeros(config.n_think, d))
+
         # Pre-compute board position indices (col/rank) — registered as buffers so
         # they follow device/dtype moves automatically.
         cols = torch.arange(90) % 9  # shape [90]
@@ -323,13 +354,22 @@ class BoardTransformer(nn.Module):
         pos = self._positional_embeddings(boards.device)  # [91, d]
         x = x + pos.unsqueeze(0)  # [B, 91, d]
 
+        # Append the latent [THINK] tokens (their own learned vectors) — extra
+        # bidirectionally-attended slots that give the model compute before the
+        # heads read out. Input contract stays boards:[B,91]; n_think=0 skips this.
+        if self.config.n_think > 0:
+            b = x.shape[0]
+            think = self.think_emb.unsqueeze(0).expand(b, -1, -1)  # [B, n_think, d]
+            x = torch.cat([x, think], dim=1)  # [B, 91+n_think, d]
+
         # Transformer blocks (with optional grad checkpointing)
-        x = self._run_blocks(x)  # [B, 91, d]
+        x = self._run_blocks(x)  # [B, 91(+n_think), d]
 
         # Normalise output
-        x = self.norm_out(x)  # [B, 91, d]
+        x = self.norm_out(x)
 
-        # Extract the side-to-move token (index 90) as the aggregate representation
+        # Extract the side-to-move token (index 90) as the aggregate representation.
+        # It attends over the [THINK] slots, so their computation flows into it.
         cls = x[:, 90, :]  # [B, d]
 
         # Policy head
@@ -372,3 +412,41 @@ class BoardTransformer(nn.Module):
         model.load_state_dict(ckpt["state_dict"])
         model.eval()
         return model, ckpt.get("extra", {})
+
+    @torch.no_grad()
+    def warm_start_from(
+        self, path: str | Path, *, map_location: Any = "cpu"
+    ) -> dict[str, list[str]]:
+        """Copy shape-matching weights from another checkpoint into THIS model.
+
+        For enabling think tokens (``--init-from``): build the new-arch model
+        (e.g. n_think=4), then graft a pre-think checkpoint's weights. Tensors
+        that match shape are copied; ``think_emb`` (absent/empty in the source)
+        and any grown ``rel_bias`` think-bucket column are left at their zero
+        init. Returns ``{"copied": [...], "skipped": [...]}``.
+        """
+        src = torch.load(path, map_location=map_location, weights_only=False)["state_dict"]
+        own = self.state_dict()
+        copied: list[str] = []
+        skipped: list[str] = []
+        for k, dst in own.items():
+            if k not in src:
+                skipped.append(k)
+                continue
+            s = src[k]
+            if s.shape == dst.shape:
+                dst.copy_(s)
+                copied.append(k)
+            elif (
+                k.endswith("rel_bias")
+                and s.dim() == 2
+                and dst.dim() == 2
+                and s.shape[0] == dst.shape[0]
+                and s.shape[1] <= dst.shape[1]
+            ):
+                # Grown table (added think bucket): copy overlap, keep new col zero.
+                dst[:, : s.shape[1]].copy_(s)
+                copied.append(f"{k}[:, :{s.shape[1]}]")
+            else:
+                skipped.append(k)
+        return {"copied": copied, "skipped": skipped}
