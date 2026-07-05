@@ -48,6 +48,16 @@ def eval_to_value(ev: PikafishEval, cp_scale: float) -> float:
     return math.nan
 
 
+def _full_fen(fen: str) -> str:
+    """Pad a 2-field FEN (placement + side, as BoardTokenizer.decode emits) to the
+    full 6-field form Pikafish's UCI parser needs (``… - - 0 1``)."""
+    parts = fen.split()
+    if len(parts) >= 6:
+        return fen
+    parts += ["-", "-", "0", "1"][: 6 - len(parts)]
+    return " ".join(parts)
+
+
 def _status_path(status_dir: Path) -> Path:
     return status_dir / "status.json"
 
@@ -145,7 +155,7 @@ def label_eval(
 
         start = resume_pos if si == resume_shard else 0
         for i in range(start, n):
-            fen = tok.decode([int(x) for x in boards[i]])
+            fen = _full_fen(tok.decode([int(x) for x in boards[i]]))
             if fen in cache:
                 arr[i] = cache[fen]
                 cache_hits += 1

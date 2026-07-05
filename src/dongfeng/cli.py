@@ -451,7 +451,11 @@ def data_label_eval(
     import os as _os  # noqa: PLC0415
 
     from .data.label_eval import label_eval  # noqa: PLC0415
-    from .engines.pikafish_engine import EngineNotAvailableError, PikafishEngine  # noqa: PLC0415
+    from .engines.pikafish_engine import (  # noqa: PLC0415
+        EngineNotAvailableError,
+        PikafishEngine,
+        PikafishEval,
+    )
 
     engine = PikafishEngine(engine_path or None)
     try:
@@ -459,6 +463,18 @@ def data_label_eval(
     except EngineNotAvailableError as exc:
         _console.print(f"[red]Pikafish not available:[/red] {exc}")
         raise typer.Exit(1) from None
+
+    def _safe_eval(fen: str, d: int) -> PikafishEval:
+        """Evaluate one position; on engine death, restart once and retry, else mask."""
+        for attempt in (1, 2):
+            try:
+                return engine.evaluate(fen, depth=d)
+            except EngineNotAvailableError:
+                if attempt == 2:
+                    return PikafishEval()  # give up on this position → NaN (masked)
+                engine.close()
+                engine.new_game()  # restart the subprocess and retry
+        return PikafishEval()
 
     status_dir = _os.path.join(_os.environ.get("DONGFENG_RUNS_DIR", "runs"), f"label-{id}")
 
@@ -474,7 +490,7 @@ def data_label_eval(
     _console.print(f"[bold]Labeling[/bold] {data_dir} with Pikafish depth={depth} → {status_dir}")
     res = label_eval(
         data_dir,
-        evaluator=lambda fen, d: engine.evaluate(fen, depth=d),
+        evaluator=_safe_eval,
         depth=depth,
         cp_scale=cp_scale,
         status_dir=status_dir,
