@@ -133,17 +133,34 @@ crontab -e
 
 ### When the machine dies → move to a new one
 
+`provision.yml` does the whole rebuild in **one command** — it orchestrates
+`setup.yml` (which imports `observability.yml`) → `nopasswd-sudo.yml` →
+`pull-model.yml` (only if `-e hf_model=…`) → `start-train.yml`:
+
 ```bash
 # 1. Point the inventory at the new host (edit ansible_host / ansible_port)
 #    and copy your SSH key over:
 ssh-copy-id -i ~/.ssh/dongfeng_5090.pub -p <port> ezycloudx-admin@<new-host>
 
-# 2. Re-run setup with the SAME tunnel id. It pushes the local checkpoint
-#    mirror from this Mac up to the new server before starting.
+# 2. One-shot full bring-up with the SAME tunnel id (the tunnel is a Cloudflare
+#    resource, reused across boxes). Add -e hf_model=<name> to seed weights from
+#    the HF Hub for a warm resume; omit it to train from scratch.
 cd deploy
-ansible-playbook setup.yml --ask-become-pass -e tunnel_id=$TUNNEL_ID
+ansible-playbook provision.yml --ask-become-pass \
+  -e tunnel_id=$TUNNEL_ID -e hf_model=board-5090-mid
+```
 
-# 3. Resume training (also pushes the latest local mirror up first).
+This leaves the box fully online: deps + PyTorch cu128, data shards, the secure
+Cloudflare tunnel, all systemd services, the Prometheus/Grafana monitoring stack,
+passwordless `dongfeng-*` restarts (so later `update.yml` needs no sudo prompt),
+serving weights pulled from HF, and training started/resumed.
+
+You can still run each step à la carte (they're independent playbooks) — e.g.
+just `setup.yml` then `start-train.yml` — if you don't want the full chain:
+
+```bash
+ansible-playbook setup.yml --ask-become-pass -e tunnel_id=$TUNNEL_ID
+ansible-playbook nopasswd-sudo.yml --ask-become-pass   # passwordless restarts
 ansible-playbook start-train.yml --ask-become-pass
 ```
 
@@ -211,7 +228,8 @@ journalctl -u dongfeng-tunnel -f
 
 - `inventory.ini` — Server connection (SSH key, **git-ignored**, never commit)
 - `ansible.cfg` — Ansible settings
-- `setup.yml` — Full server bootstrap (deps, PyTorch cu128, secure tunnel)
+- `provision.yml` — **One-shot full rebuild** of a wiped box: setup + nopasswd-sudo + (optional) HF pull + start-train
+- `setup.yml` — Full server bootstrap (deps, PyTorch cu128, secure tunnel); imports `observability.yml`
 - `start-train.yml` — Start/restart training
 - `backup.yml` — Pull checkpoints/runs from server down to this Mac
 - `monitor.yml` — Health check all services

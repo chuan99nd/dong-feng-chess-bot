@@ -1,0 +1,62 @@
+---
+# deploy/provision.yml — FULL bring-up of a fresh / replacement GPU box.
+#
+# One command turns a wiped machine back into a running Dong Feng box. It just
+# orchestrates the existing single-purpose playbooks in the right order; each
+# step is still runnable on its own for incremental changes.
+#
+# Order (each is a full playbook — see its own header for details):
+#   1. setup.yml         — system deps, uv, clone repo, PyTorch cu128, push the
+#                          local checkpoints/runs/monitoring mirrors up, upload
+#                          data shards, install + configure the Cloudflare named
+#                          tunnel, create systemd services, start web + tunnel,
+#                          and (imported by setup.yml) bring up the observability
+#                          stack: Prometheus + Grafana + node/GPU/model exporters.
+#   2. nopasswd-sudo.yml — restricted NOPASSWD sudo for the dongfeng-* systemctl
+#                          commands, so later `update.yml` restarts need no
+#                          password. (Without this, update.yml's `sudo -n` restart
+#                          step fails on a fresh box — see the deploy README.)
+#   3. pull-model.yml    — download a model from the Hugging Face Hub into the
+#                          server's models/ so the web engine can serve trained
+#                          weights. Runs ONLY when -e hf_model=<name> is given
+#                          (models live on HF, not git).
+#   4. start-train.yml   — start / resume training. Auto-resumes from an existing
+#                          runs/<run_id>/ckpt.pt (pushed up in step 1); if none
+#                          exists and -e hf_model is set, it seeds from that HF
+#                          model for a warm restart.
+#
+# Prerequisites (same as setup.yml — do these ONCE on your Mac first):
+#   - inventory.ini points at the new host (ansible_host / ansible_port).
+#   - ssh-copy-id the deploy key to the new box.
+#   - The Cloudflare named tunnel already exists and its credential file is on
+#     this Mac: cloudflared tunnel login / create dongfeng / route dns …, leaving
+#     ~/.cloudflared/<TUNNEL_ID>.json. (The tunnel is a Cloudflare resource — the
+#     SAME tunnel_id is reused across box replacements; the domain doesn't change.)
+#   - .env holds HF_TOKEN if pulling a private HF model.
+#
+# Usage:
+#   cd deploy
+#   # minimal (fresh weights, train from scratch on the default preset):
+#   ansible-playbook provision.yml --ask-become-pass -e tunnel_id=<TUNNEL_ID>
+#   # seed weights + training from an HF model, pick a preset/tag:
+#   ansible-playbook provision.yml --ask-become-pass \
+#     -e tunnel_id=<TUNNEL_ID> -e hf_model=board-5090-mid \
+#     -e train_preset=mid -e gpu_tag=5060ti
+#
+# --ask-become-pass is required: setup/nopasswd/observability write to /etc and
+# apt. It's prompted once and reused across every play. (pull-model runs
+# unprivileged; that's fine — the become password just goes unused there.)
+
+- import_playbook: setup.yml
+
+- import_playbook: nopasswd-sudo.yml
+
+# Optional: fetch serving weights from HF. Skipped entirely when hf_model is
+# unset, so a from-scratch box still provisions cleanly. `when` on an
+# import_playbook is applied to every task inside it, including its assert.
+- import_playbook: pull-model.yml
+  vars:
+    model_name: "{{ hf_model | default('') }}"
+  when: (hf_model | default('')) | length > 0
+
+- import_playbook: start-train.yml
