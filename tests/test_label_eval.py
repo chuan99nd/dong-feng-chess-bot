@@ -32,6 +32,16 @@ def test_parse_info_score(line: str, expected: tuple[int | None, int | None]) ->
     assert PikafishEngine._parse_info_score(line) == expected
 
 
+def test_full_fen_side_and_padding() -> None:
+    from dongfeng.data.label_eval import _full_fen
+
+    # r→w side map + pad to 6 fields (Pikafish rejects "r" and short FENs).
+    out = _full_fen("rnbakabnr/9 r")
+    assert out == "rnbakabnr/9 w - - 0 1"
+    assert _full_fen("x/9 b").split()[1] == "b"
+    assert _full_fen("x/9 w - - 0 1") == "x/9 w - - 0 1"
+
+
 def test_eval_to_value() -> None:
     assert eval_to_value(PikafishEval(mate=2), 300.0) == 1.0
     assert eval_to_value(PikafishEval(mate=-1), 300.0) == -1.0

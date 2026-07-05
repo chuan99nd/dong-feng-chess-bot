@@ -49,12 +49,18 @@ def eval_to_value(ev: PikafishEval, cp_scale: float) -> float:
 
 
 def _full_fen(fen: str) -> str:
-    """Pad a 2-field FEN (placement + side, as BoardTokenizer.decode emits) to the
-    full 6-field form Pikafish's UCI parser needs (``… - - 0 1``)."""
+    """Normalise our FEN to the form Pikafish's UCI parser accepts.
+
+    Two fixes: (1) our side-to-move field is ``r``/``b`` (red/black) but Pikafish
+    uses ``w``/``b`` (red = white), so map ``r``→``w``; (2) pad the 2-field FEN
+    (placement + side, as BoardTokenizer.decode emits) to the full 6-field form
+    ``… - - 0 1``.
+    """
     parts = fen.split()
-    if len(parts) >= 6:
-        return fen
-    parts += ["-", "-", "0", "1"][: 6 - len(parts)]
+    if len(parts) >= 2 and parts[1] == "r":
+        parts[1] = "w"
+    if len(parts) < 6:
+        parts += ["-", "-", "0", "1"][: 6 - len(parts)]
     return " ".join(parts)
 
 
