@@ -470,6 +470,24 @@ def _get_run_detail(run_id: str) -> tuple[dict[str, Any], int]:
     return {"run": data, "metrics": metrics}, 200
 
 
+def _list_labeling() -> list[dict[str, Any]]:
+    """Pikafish label-eval jobs: read runs/label-*/status.json, newest first."""
+    root = _runs_root()
+    jobs: list[dict[str, Any]] = []
+    if not root.is_dir():
+        return jobs
+    for d in root.glob("label-*"):
+        sp = d / "status.json"
+        if not sp.is_file():
+            continue
+        try:
+            jobs.append(json.loads(sp.read_text()))
+        except Exception:
+            continue
+    jobs.sort(key=lambda j: j.get("updated") or "", reverse=True)
+    return jobs
+
+
 def _read_profile(run_id: str) -> dict[str, Any]:
     """Return runs/<id>/profile.json (PyTorch profiler op breakdown), or {} if absent."""
     if not run_id:
@@ -562,6 +580,8 @@ def _make_handler(session: GameSession) -> type[BaseHTTPRequestHandler]:
                 self._send_json({"checkpoints": _list_checkpoints()})
             elif self.path == "/api/system":
                 self._send_json(_get_system_info())
+            elif self.path == "/api/labeling":
+                self._send_json({"jobs": _list_labeling()})
             elif self.path.startswith("/api/profile"):
                 parsed = urllib.parse.urlparse(self.path)
                 qs = urllib.parse.parse_qs(parsed.query)
@@ -762,6 +782,17 @@ _HTML = r"""<!doctype html>
         <option value="">-- chọn run --</option>
       </select>
     </div>
+    <div class="card" id="labeling-card" style="display:none;">
+      <label style="margin-bottom:4px;">Pikafish label-gen (nhãn value)</label>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <strong id="labeling-id" style="font-size:14px;"></strong>
+        <span id="labeling-status" class="status-badge"></span>
+        <span id="labeling-eta" style="font-size:12px;color:#aaa;margin-left:auto;"></span>
+      </div>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" id="labeling-fill" style="width:0%"></div></div>
+      <div class="progress-label" id="labeling-label"></div>
+      <div class="chips" id="labeling-chips"></div>
+    </div>
     <div class="card" id="training-stats-card" style="display:none;">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;">
         <strong id="training-run-id" style="font-size:15px;"></strong>
@@ -844,7 +875,7 @@ function switchTab(name){
   document.querySelectorAll(".tab-btn").forEach(el=>el.classList.remove("active"));
   document.getElementById("tab-"+name).classList.add("active");
   event.target.classList.add("active");
-  if(name==="training") loadModels();
+  if(name==="training"){ loadModels(); loadLabeling(); }
 }
 
 // ---- Board play ----
@@ -1008,6 +1039,33 @@ let _systemPollTimer = null;
 let _currentRunId = null;
 let _selectedArch = "";   // "" = all models
 let _modelsCache = [];
+
+// ---- Pikafish label-gen monitor ----
+async function loadLabeling(){
+  try{
+    const data = await (await fetch("/api/labeling")).json();
+    const jobs = data.jobs||[];
+    const card = document.getElementById("labeling-card");
+    if(!jobs.length){ card.style.display="none"; return; }
+    const j = jobs[0];
+    card.style.display="";
+    document.getElementById("labeling-id").textContent = "label-gen";
+    const badge=document.getElementById("labeling-status");
+    badge.textContent=j.status; badge.className="status-badge status-"+(j.status==="done"?"done":"running");
+    const pct = j.total ? Math.min(100, j.done/j.total*100) : 0;
+    document.getElementById("labeling-fill").style.width = pct.toFixed(1)+"%";
+    document.getElementById("labeling-label").textContent =
+      `${(j.done||0).toLocaleString()} / ${(j.total||0).toLocaleString()} vị trí (${pct.toFixed(1)}%)`;
+    const eta=j.eta_s!=null?(j.eta_s/3600).toFixed(1)+"h":"—";
+    document.getElementById("labeling-eta").textContent = j.status==="running"?("ETA ~"+eta):"";
+    document.getElementById("labeling-chips").innerHTML=[
+      ["depth", j.depth], ["pos/s", j.rate_pos_s], ["unique", (j.unique_evaluated||0).toLocaleString()],
+      ["cache hits", (j.cache_hits||0).toLocaleString()],
+    ].map(([k,v])=>`<div class="chip">${k}: <span>${v}</span></div>`).join("");
+  }catch(e){ /* no labeling */ }
+}
+// Poll while the Training tab is visible (labeling runs independently of a run).
+setInterval(()=>{ const t=document.getElementById("tab-training"); if(t&&t.classList.contains("active")) loadLabeling(); }, 4000);
 
 async function loadModels(){
   try {

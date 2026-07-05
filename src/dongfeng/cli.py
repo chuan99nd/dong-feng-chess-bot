@@ -432,6 +432,61 @@ def data_stats(
         _console.print(ttable)
 
 
+@data_app.command("label-eval")
+def data_label_eval(
+    data_dir: str = typer.Option(..., "--data", help="Board dataset dir (unaugmented stem)."),
+    id: str = typer.Option("label", "--id", help="Label run id (status under runs/label-<id>)."),
+    depth: int = typer.Option(18, "--depth", help="Pikafish search depth per position."),
+    cp_scale: float = typer.Option(300.0, "--cp-scale", help="value = tanh(cp / cp_scale)."),
+    engine_path: str = typer.Option(
+        "", "--engine", help="Pikafish binary (else $DONGFENG_PIKAFISH/PATH)."
+    ),
+) -> None:
+    """Label positions with Pikafish value/state scores (Phase 4 distillation).
+
+    Writes values_eval_<stem>.bin float32 shards next to the board shards and a
+    live runs/label-<id>/status.json (progress/rate/ETA) for the web monitor.
+    Resumable — re-run to continue an interrupted job.
+    """
+    import os as _os  # noqa: PLC0415
+
+    from .data.label_eval import label_eval  # noqa: PLC0415
+    from .engines.pikafish_engine import EngineNotAvailableError, PikafishEngine  # noqa: PLC0415
+
+    engine = PikafishEngine(engine_path or None)
+    try:
+        engine.new_game()
+    except EngineNotAvailableError as exc:
+        _console.print(f"[red]Pikafish not available:[/red] {exc}")
+        raise typer.Exit(1) from None
+
+    status_dir = _os.path.join(_os.environ.get("DONGFENG_RUNS_DIR", "runs"), f"label-{id}")
+
+    def _progress(s: dict[str, object]) -> None:
+        eta = s.get("eta_s")
+        eta_h = f"{eta / 3600:.1f}h" if isinstance(eta, (int, float)) else "?"
+        _console.print(
+            f"  {s['done']}/{s['total']} · {s['rate_pos_s']} pos/s · ETA {eta_h} · "
+            f"unique {s['unique_evaluated']} · cache {s['cache_hits']}",
+            end="\r",
+        )
+
+    _console.print(f"[bold]Labeling[/bold] {data_dir} with Pikafish depth={depth} → {status_dir}")
+    res = label_eval(
+        data_dir,
+        evaluator=lambda fen, d: engine.evaluate(fen, depth=d),
+        depth=depth,
+        cp_scale=cp_scale,
+        status_dir=status_dir,
+        on_flush=_progress,
+    )
+    engine.close()
+    _console.print(
+        f"\n[green]Done[/green] {res['done']}/{res['total']} positions "
+        f"({res['unique_evaluated']} unique). Shards: values_eval_*.bin in {data_dir}"
+    )
+
+
 @data_app.command("tokenize")
 def data_tokenize(
     text: str = typer.Argument(..., help="ICCS move(s) like 'h2e2 h9g7', or a FEN with --board."),

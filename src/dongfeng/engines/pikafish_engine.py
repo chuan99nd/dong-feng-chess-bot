@@ -36,9 +36,24 @@ import os
 import shutil
 import subprocess
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from ..core import STARTING_FEN, Move
 from ..protocol.engine import Analysis, EngineInfo, ScoredMove, SearchLimits
+
+
+@dataclass(frozen=True)
+class PikafishEval:
+    """A static evaluation of a position, from the side-to-move's perspective.
+
+    UCI ``score`` is mover-relative. Exactly one of ``cp`` (centipawns) / ``mate``
+    (mate-in-N; sign = side to move) is set for a well-formed eval; both ``None``
+    means no score was seen.
+    """
+
+    cp: int | None = None
+    mate: int | None = None
+
 
 # Environment variable consulted when no ``EnginePath`` option is set.
 _ENV_PATH = "DONGFENG_PIKAFISH"
@@ -114,6 +129,55 @@ class PikafishEngine:
         if best is None:
             raise EngineNotAvailableError("engine returned no bestmove")
         return best
+
+    # -- static evaluation (distillation teacher) ---------------------------
+
+    def evaluate(
+        self, fen: str, *, depth: int = 18, moves: list[Move] | None = None
+    ) -> PikafishEval:
+        """Return Pikafish's mover-relative score for a position (``go depth``).
+
+        Parses the deepest ``info … score cp N`` / ``score mate N`` line before
+        ``bestmove``. Used to generate value/state labels for distillation
+        (Phase 4). ``score`` is relative to the side to move, matching the
+        board model's mover-relative value target.
+        """
+        self._root_fen = fen
+        self._moves = list(moves or [])
+        self._ensure_started()
+        self._send_position()
+        self._send(f"go depth {depth}")
+        cp: int | None = None
+        mate: int | None = None
+        for line in self._read_until("bestmove"):
+            if not line.startswith("info") or "score" not in line:
+                continue
+            if "lowerbound" in line or "upperbound" in line:
+                continue  # skip fail-high/low bounds; wait for the exact score
+            c, m = self._parse_info_score(line)
+            if c is not None or m is not None:
+                cp, mate = c, m  # keep the latest (deepest) exact score
+        return PikafishEval(cp=cp, mate=mate)
+
+    @staticmethod
+    def _parse_info_score(line: str) -> tuple[int | None, int | None]:
+        """Extract ``(cp, mate)`` from a UCI ``info … score cp/mate N`` line."""
+        toks = line.split()
+        try:
+            i = toks.index("score")
+        except ValueError:
+            return None, None
+        if i + 2 >= len(toks):
+            return None, None
+        kind, val = toks[i + 1], toks[i + 2]
+        try:
+            if kind == "cp":
+                return int(val), None
+            if kind == "mate":
+                return None, int(val)
+        except ValueError:
+            return None, None
+        return None, None
 
     # -- options / control --------------------------------------------------
 
